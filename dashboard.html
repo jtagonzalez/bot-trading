@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>GOLD 4.0 Dashboard</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#0a0a0f; color:#e0e0e0; font-family:'Segoe UI',system-ui,sans-serif; }
+    ::-webkit-scrollbar { width:6px; height:6px; }
+    ::-webkit-scrollbar-track { background:rgba(255,255,255,0.03); }
+    ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.12); border-radius:3px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef, Component } = React;
+
+class ErrorBoundary extends Component {
+  constructor(p) { super(p); this.state = { err: null }; }
+  static getDerivedStateFromError(e) { return { err: e }; }
+  render() {
+    if (this.state.err) return (
+      <div style={{ padding:40, color:"#ff1744", fontFamily:"monospace", background:"#0a0a0f", minHeight:"100vh" }}>
+        <div style={{ fontSize:18, marginBottom:12 }}>⚠️ Error en el dashboard</div>
+        <div style={{ fontSize:12, color:"rgba(255,255,255,0.5)", marginBottom:20 }}>{String(this.state.err)}</div>
+        <button onClick={()=>this.setState({err:null})}
+          style={{ background:"rgba(255,255,255,0.1)", border:"1px solid rgba(255,255,255,0.2)",
+                   color:"#e0e0e0", padding:"8px 20px", borderRadius:8, cursor:"pointer" }}>
+          🔄 Reintentar
+        </button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+// ── palette ──────────────────────────────────────
+const C = {
+  win:   "#00e676", loss: "#ff1744", tie: "#ffc400",
+  call:  "#00e676", put:  "#ff1744",
+  gold:  "#ffc400", purple: "#b388ff", blue: "#40c4ff",
+  bg:    "#0a0a0f", card: "rgba(255,255,255,0.03)",
+  border:"rgba(255,255,255,0.07)",
+};
+
+// ── helpers ───────────────────────────────────────
+const fmt$  = v => `$${Number(v||0).toFixed(2)}`;
+const fmtP  = v => `${Number(v||0).toFixed(1)}%`;
+const fmtTs = ts => ts ? new Date(ts).toLocaleString("es",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "—";
+const fmtDate = ts => ts ? ts.slice(0,10) : "—";
+const clr   = r => r==="win" ? C.win : r==="loss" ? C.loss : C.tie;
+
+// ── tiny components ───────────────────────────────
+function Card({ children, style={} }) {
+  return <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:"18px 20px", ...style }}>{children}</div>;
+}
+function Label({ children }) {
+  return <div style={{ fontSize:10, letterSpacing:"0.1em", textTransform:"uppercase", color:"rgba(255,255,255,0.35)", marginBottom:6 }}>{children}</div>;
+}
+function Big({ children, color }) {
+  return <div style={{ fontSize:26, fontWeight:800, color:color||"#e0e0e0", fontFamily:"'Courier New',monospace" }}>{children}</div>;
+}
+function Badge({ text, color }) {
+  return <span style={{ background:`${color}22`, color, border:`1px solid ${color}44`, borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:700 }}>{text}</span>;
+}
+function Dot({ live }) {
+  return <span style={{ display:"inline-block", width:8, height:8, borderRadius:"50%", background: live ? C.win : "#555", boxShadow: live ? `0 0 8px ${C.win}` : "none", animation: live ? "pulse 2s infinite" : "none" }}/>;
+}
+
+function WinRing({ rate, size=110 }) {
+  const r = (size-10)/2, circ = 2*Math.PI*r;
+  const color = rate>=65 ? C.win : rate>=50 ? C.tie : C.loss;
+  return (
+    <div style={{ position:"relative", width:size, height:size }}>
+      <svg width={size} height={size} style={{ transform:"rotate(-90deg)" }}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth={8}/>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={8}
+          strokeDasharray={circ} strokeDashoffset={circ-(rate/100)*circ}
+          strokeLinecap="round" style={{ transition:"stroke-dashoffset 1s ease" }}/>
+      </svg>
+      <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+        <span style={{ fontSize:22, fontWeight:800, color, fontFamily:"monospace" }}>{rate.toFixed(1)}%</span>
+        <span style={{ fontSize:9, color:"rgba(255,255,255,0.3)", textTransform:"uppercase" }}>Win Rate</span>
+      </div>
+    </div>
+  );
+}
+
+function Sparkline({ data=[], color=C.win, w=90, h=32 }) {
+  if(data.length < 2) return null;
+  const mn=Math.min(...data), mx=Math.max(...data), rng=mx-mn||1;
+  const pts = data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/rng)*(h-4)-2}`).join(" ");
+  return <svg width={w} height={h} style={{ display:"block" }}><polyline points={pts} fill="none" stroke={color} strokeWidth={1.8} strokeLinecap="round"/></svg>;
+}
+
+function Table({ cols, rows, emptyMsg="Sin datos" }) {
+  if(!rows||!rows.length) return <div style={{ color:"rgba(255,255,255,0.25)", textAlign:"center", padding:40, fontSize:13 }}>{emptyMsg}</div>;
+  return (
+    <div style={{ overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, fontFamily:"monospace" }}>
+        <thead>
+          <tr style={{ borderBottom:`1px solid ${C.border}` }}>
+            {cols.map(c=><th key={c.key} style={{ padding:"10px 8px", textAlign:"left", color:"rgba(255,255,255,0.3)", fontWeight:500, fontSize:10, textTransform:"uppercase", letterSpacing:"0.06em", whiteSpace:"nowrap" }}>{c.label}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r,i)=>(
+            <tr key={i} style={{ background:i%2===0?"transparent":"rgba(255,255,255,0.015)", borderBottom:`1px solid rgba(255,255,255,0.025)` }}>
+              {cols.map(c=><td key={c.key} style={{ padding:"8px 8px", whiteSpace:"nowrap", ...( c.style ? c.style(r) : {}) }}>{c.render ? c.render(r) : r[c.key]}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── TRADE CHART ───────────────────────────────────
+function TradeChart({ activo, direccion, precioEntrada }) {
+  const ref = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+
+  useEffect(() => {
+    if (!ref.current || !window.LightweightCharts) return;
+
+    const chart = LightweightCharts.createChart(ref.current, {
+      width:  ref.current.clientWidth,
+      height: 180,
+      layout: { background:{ color:"#0d0d16" }, textColor:"#666" },
+      grid:   { vertLines:{ color:"#1a1a28" }, horzLines:{ color:"#1a1a28" } },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      rightPriceScale: { borderColor:"#222236" },
+      timeScale: { borderColor:"#222236", timeVisible:true, secondsVisible:false },
+      handleScroll: false, handleScale: false,
+    });
+
+    const series = chart.addCandlestickSeries({
+      upColor:"#00e676", downColor:"#ff1744",
+      borderUpColor:"#00e676", borderDownColor:"#ff1744",
+      wickUpColor:"#00e676", wickDownColor:"#ff1744",
+    });
+
+    chartRef.current  = chart;
+    seriesRef.current = series;
+
+    fetch(`/api/candles?activo=${activo}&n=60`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.length) return;
+        series.setData(data);
+        if (precioEntrada) {
+          const line = {
+            price: precioEntrada,
+            color: direccion === "call" ? "#00e676" : "#ff1744",
+            lineWidth: 1, lineStyle: 2,
+            axisLabelVisible: true,
+            title: direccion === "call" ? "▲ ENTRY" : "▼ ENTRY",
+          };
+          series.createPriceLine(line);
+        }
+        const last = data[data.length - 1];
+        series.setMarkers([{
+          time: last.time,
+          position: direccion === "call" ? "belowBar" : "aboveBar",
+          color: direccion === "call" ? "#00e676" : "#ff1744",
+          shape: direccion === "call" ? "arrowUp" : "arrowDown",
+          text:  direccion === "call" ? "CALL" : "PUT",
+        }]);
+        chart.timeScale().fitContent();
+      })
+      .catch(() => {});
+
+    const resize = () => {
+      if (ref.current && chartRef.current)
+        chartRef.current.applyOptions({ width: ref.current.clientWidth });
+    };
+    window.addEventListener("resize", resize);
+
+    // update last candle every 10s
+    const poll = setInterval(() => {
+      fetch(`/api/candles?activo=${activo}&n=3`)
+        .then(r => r.json())
+        .then(data => data.forEach(c => seriesRef.current?.update(c)))
+        .catch(() => {});
+    }, 10000);
+
+    return () => {
+      clearInterval(poll);
+      window.removeEventListener("resize", resize);
+      chart.remove();
+    };
+  }, [activo]);
+
+  return <div ref={ref} style={{ width:"100%", borderRadius:8, overflow:"hidden" }}/>;
+}
+
+// ── COUNTDOWN ─────────────────────────────────────
+function Countdown({ tsExpira }) {
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    const tick = () => {
+      const diff = Math.max(0, Math.round((new Date(tsExpira) - Date.now()) / 1000));
+      setSecs(diff);
+    };
+    tick();
+    const id = setInterval(tick, 500);
+    return () => clearInterval(id);
+  }, [tsExpira]);
+
+  const color = secs <= 10 ? C.loss : secs <= 30 ? C.tie : C.win;
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return (
+    <span style={{ fontSize:22, fontWeight:800, color, fontFamily:"monospace",
+                   animation: secs <= 10 ? "pulse 0.5s infinite" : "none" }}>
+      {m > 0 ? `${m}:${String(s).padStart(2,"0")}` : `${s}s`}
+    </span>
+  );
+}
+
+// ── TRADE CARD ────────────────────────────────────
+function TradeCard({ trade, closed=false }) {
+  const { activo="", direccion="", monto=0, payout=0, paso=1,
+          ts_expira, precio_entrada=0, resultado="", ganancia=0 } = trade || {};
+
+  const isCall    = direccion === "call";
+  const dirColor  = isCall ? C.win : C.loss;
+  const resColor  = resultado === "win" ? C.win : resultado === "loss" ? C.loss : C.tie;
+  const borderClr = closed ? resColor + "55" : dirColor + "55";
+
+  const openChart = () => {
+    if (activo) window.open(`/chart.html?activo=${encodeURIComponent(activo)}&payout=${payout}`, `chart_${activo}`, "width=960,height=580,resizable=yes");
+  };
+
+  return (
+    <div style={{
+      border: `1px solid ${borderClr}`, borderRadius:14,
+      background: closed ? `${resColor}08` : `${dirColor}06`,
+      minWidth:260, flex:"1 1 260px", transition:"all 0.4s",
+    }}>
+      {/* header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+                    padding:"12px 16px", borderBottom:`1px solid rgba(255,255,255,0.06)` }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <Badge text={isCall ? "▲ CALL" : "▼ PUT"} color={dirColor}/>
+          <span style={{ fontWeight:700, fontSize:14, cursor:"pointer", textDecoration:"underline dotted" }}
+                onClick={openChart} title="Ver gráfico">
+            {activo.replace("-OTC","")}
+          </span>
+          {activo.includes("OTC") && <span style={{ fontSize:9, color:"rgba(255,255,255,0.25)" }}>OTC</span>}
+        </div>
+        <div>
+          {!closed
+            ? <Countdown tsExpira={ts_expira}/>
+            : <Badge text={resultado?.toUpperCase()||"—"} color={resColor}/>}
+        </div>
+      </div>
+
+      {/* stats grid */}
+      <div style={{ display:"flex" }}>
+        {[
+          ["Monto",   `$${Number(monto).toFixed(2)}`],
+          ["Payout",  `${Number(payout).toFixed(1)}%`],
+          ["Paso",    paso > 1 ? `M${paso}` : "1"],
+          closed
+            ? ["P/L",    `${ganancia>=0?"+":""}$${Number(ganancia).toFixed(2)}`]
+            : ["Entrada",`${Number(precio_entrada).toFixed(5)}`],
+        ].map(([k,v], i) => (
+          <div key={k} style={{ flex:1, padding:"10px 0", textAlign:"center",
+                                borderRight: i<3 ? "1px solid rgba(255,255,255,0.05)" : "none" }}>
+            <div style={{ fontSize:9, color:"rgba(255,255,255,0.3)", textTransform:"uppercase", marginBottom:3 }}>{k}</div>
+            <div style={{ fontSize:13, fontWeight:700, fontFamily:"monospace",
+                          color: k==="P/L" ? (ganancia>=0?C.win:C.loss) : "rgba(255,255,255,0.85)" }}>{v}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* resultado */}
+      {closed && (
+        <div style={{ padding:"8px 16px", textAlign:"center", fontSize:14, fontWeight:800, color:resColor }}>
+          {resultado==="win"  ? `✅ +$${Number(ganancia).toFixed(2)}`
+          :resultado==="loss" ? `❌ -$${Math.abs(ganancia).toFixed(2)}`
+          :                     `➖ EMPATE`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── TRADE MONITOR ─────────────────────────────────
+function TradeMonitor() {
+  const [vivos,     setVivos]     = useState([]);
+  const [recientes, setRecientes] = useState([]);
+
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        const [v, r] = await Promise.all([
+          fetch("/api/trades-vivos").then(x => x.json()),
+          fetch("/api/trades-recientes").then(x => x.json()),
+        ]);
+        setVivos(Array.isArray(v) ? v : []);
+        setRecientes(Array.isArray(r) ? r : []);
+      } catch {}
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!vivos.length && !recientes.length) return null;
+
+  return (
+    <div style={{ marginBottom:20 }}>
+      {vivos.length > 0 && (
+        <>
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:12 }}>
+            <Label style={{ margin:0 }}>⚡ TRADES ACTIVOS</Label>
+            <span style={{ fontSize:10, color:C.gold, animation:"pulse 1s infinite" }}>EN VIVO</span>
+            <Badge text={`${vivos.length} abierto${vivos.length>1?"s":""}`} color={C.gold}/>
+          </div>
+          <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:16 }}>
+            {vivos.map(t => <TradeCard key={t.activo} trade={t} closed={false}/>)}
+          </div>
+        </>
+      )}
+
+      {recientes.length > 0 && (
+        <>
+          <Label>📜 TRADES RECIENTES</Label>
+          <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginTop:8 }}>
+            {recientes.slice(0,4).map((t,i) => <TradeCard key={i} trade={t} closed={true}/>)}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── ASSET CHART MODAL ─────────────────────────────
+function AssetChartModal({ activo, payout, onClose }) {
+  const ref      = useRef(null);
+  const chartRef = useRef(null);
+  const serRef   = useRef(null);
+  const [loading, setLoading] = useState(true);
+  const [lastPrice, setLastPrice] = useState(null);
+  const [priceColor, setPriceColor] = useState("#e0e0e0");
+
+  useEffect(() => {
+    if (!ref.current || !window.LightweightCharts) return;
+
+    const chart = LightweightCharts.createChart(ref.current, {
+      width:  ref.current.clientWidth,
+      height: 380,
+      layout: { background:{ color:"#0d0d16" }, textColor:"#888" },
+      grid:   { vertLines:{ color:"#161625" }, horzLines:{ color:"#161625" } },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      rightPriceScale: { borderColor:"#222236" },
+      timeScale: { borderColor:"#222236", timeVisible:true, secondsVisible:false },
+    });
+
+    const series = chart.addCandlestickSeries({
+      upColor:"#00e676", downColor:"#ff1744",
+      borderUpColor:"#00e676", borderDownColor:"#ff1744",
+      wickUpColor:"#00e676", wickDownColor:"#ff1744",
+    });
+
+    chartRef.current = chart;
+    serRef.current   = series;
+
+    fetch(`/api/candles?activo=${activo}&n=100`)
+      .then(r => r.json())
+      .then(data => {
+        setLoading(false);
+        if (!data.length) return;
+        series.setData(data);
+        const last = data[data.length - 1];
+        setLastPrice(last.close);
+        chart.timeScale().fitContent();
+      })
+      .catch(() => setLoading(false));
+
+    const resize = () => {
+      if (ref.current && chartRef.current)
+        chartRef.current.applyOptions({ width: ref.current.clientWidth });
+    };
+    window.addEventListener("resize", resize);
+
+    // poll new candles every 5s
+    const poll = setInterval(() => {
+      fetch(`/api/candles?activo=${activo}&n=3`)
+        .then(r => r.json())
+        .then(data => {
+          data.forEach(c => {
+            serRef.current?.update(c);
+            setLastPrice(prev => {
+              setPriceColor(c.close >= (prev||c.close) ? C.win : C.loss);
+              return c.close;
+            });
+          });
+        })
+        .catch(() => {});
+    }, 5000);
+
+    return () => {
+      clearInterval(poll);
+      window.removeEventListener("resize", resize);
+      chart.remove();
+    };
+  }, [activo]);
+
+  // close on Escape
+  useEffect(() => {
+    const h = e => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
+
+  return (
+    <div onClick={onClose} style={{
+      position:"fixed", inset:0, background:"rgba(0,0,0,0.75)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      zIndex:1000, backdropFilter:"blur(4px)",
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background:"#0f0f1a", border:`1px solid rgba(255,255,255,0.1)`,
+        borderRadius:18, width:"min(900px, 96vw)", overflow:"hidden",
+        boxShadow:"0 24px 80px rgba(0,0,0,0.7)",
+      }}>
+        {/* modal header */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+                      padding:"14px 20px", borderBottom:"1px solid rgba(255,255,255,0.07)" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+            <span style={{ fontSize:18, fontWeight:800 }}>{(activo||"").replace("-OTC","")}</span>
+            {(activo||"").includes("OTC") && <Badge text="OTC" color={C.blue}/>}
+            <Badge text={`${Number(payout||0).toFixed(1)}% payout`} color={C.gold}/>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:16 }}>
+            {lastPrice && (
+              <span style={{ fontSize:20, fontWeight:800, fontFamily:"monospace",
+                             color:priceColor, transition:"color 0.3s" }}>
+                {lastPrice.toFixed(5)}
+              </span>
+            )}
+            <button onClick={onClose} style={{
+              background:"rgba(255,255,255,0.07)", border:"none", color:"#aaa",
+              width:32, height:32, borderRadius:8, cursor:"pointer", fontSize:16,
+            }}>✕</button>
+          </div>
+        </div>
+
+        {/* chart area */}
+        <div style={{ padding:12 }}>
+          {loading && (
+            <div style={{ textAlign:"center", color:"rgba(255,255,255,0.3)",
+                          padding:60, fontSize:13 }}>Cargando velas...</div>
+          )}
+          <div ref={ref} style={{ width:"100%" }}/>
+        </div>
+
+        <div style={{ padding:"8px 20px 14px", fontSize:11,
+                      color:"rgba(255,255,255,0.2)", textAlign:"center" }}>
+          Velas de 1 min · Actualización cada 5s · Click fuera o ESC para cerrar
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SCAN LIVE PANEL ───────────────────────────────
+function ScanLive() {
+  const [scan,        setScan]        = useState({ en_curso: false, activos: [], timestamp: null });
+  const [buscar,      setBuscar]      = useState("");
+  const [activoChart, setActivoChart] = useState(null); // {nombre, payout}
+
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/scan-live");
+        if (r.ok) setScan(await r.json());
+      } catch {}
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const toggleChart = (a) => {
+    setActivoChart(prev => (prev && prev.nombre === a.nombre) ? null : a);
+  };
+
+  const openPopup = (a) => {
+    const url = `/chart.html?activo=${encodeURIComponent(a.nombre)}&payout=${Number(a.payout).toFixed(1)}`;
+    window.open(url, `chart_${a.nombre}`, "width=960,height=580,resizable=yes");
+  };
+
+  const todosActivos = scan.activos || [];
+  const activos      = buscar.trim()
+    ? todosActivos.filter(a => a.nombre.toLowerCase().includes(buscar.toLowerCase()))
+    : todosActivos;
+  const calificados  = todosActivos.filter(a => a.califica);
+  const total        = todosActivos.length;
+
+  const chartUrl = activoChart
+    ? `/chart.html?activo=${encodeURIComponent(activoChart.nombre)}&payout=${Number(activoChart.payout).toFixed(1)}`
+    : null;
+
+  return (
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <Label style={{ margin:0 }}>📡 ESCANEO EN VIVO</Label>
+            {scan.en_curso && (
+              <span style={{ fontSize:10, color:C.gold, animation:"pulse 1s infinite", letterSpacing:"0.1em" }}>
+                ESCANEANDO...
+              </span>
+            )}
+            {total > 0 && (
+              <span style={{ fontSize:10, color:"rgba(255,255,255,0.2)" }}>click = gráfico · shift+click = ventana nueva</span>
+            )}
+          </div>
+          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+            {total > 0 && (
+              <input
+                value={buscar}
+                onChange={e => setBuscar(e.target.value)}
+                placeholder="Buscar..."
+                style={{
+                  background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)",
+                  borderRadius:6, color:"#e0e0e0", fontSize:11, padding:"3px 10px",
+                  width:100, outline:"none",
+                }}
+              />
+            )}
+            {total > 0 && <Badge text={`${calificados.length}/${total}`} color={C.win}/>}
+            {scan.timestamp && (
+              <span style={{ fontSize:10, color:"rgba(255,255,255,0.2)" }}>
+                {new Date(scan.timestamp).toLocaleTimeString("es")}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {total === 0 ? (
+          <div style={{ color:"rgba(255,255,255,0.2)", fontSize:12, textAlign:"center", padding:"16px 0" }}>
+            Esperando primer escaneo...
+          </div>
+        ) : (
+          <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+            {activos.map((a, i) => {
+              const isLast    = scan.en_curso && i === activos.length - 1;
+              const isOpen    = activoChart && activoChart.nombre === a.nombre;
+              return (
+                <div
+                  key={a.nombre}
+                  onClick={(e) => e.shiftKey ? openPopup(a) : toggleChart(a)}
+                  style={{
+                    display:"flex", alignItems:"center", gap:6,
+                    background: isOpen
+                      ? "rgba(255,196,0,0.12)"
+                      : a.califica ? "rgba(0,230,118,0.07)" : "rgba(255,255,255,0.03)",
+                    border:`1px solid ${isOpen ? "rgba(255,196,0,0.5)" : a.califica ? "rgba(0,230,118,0.2)" : "rgba(255,255,255,0.06)"}`,
+                    borderRadius:8, padding:"5px 10px",
+                    animation: isLast ? "pulse 0.6s infinite" : "none",
+                    cursor: "pointer",
+                    transition:"all 0.15s",
+                  }}
+                >
+                  <span style={{ fontSize:11, color: a.califica ? "#e0e0e0" : "rgba(255,255,255,0.35)" }}>
+                    {(a.nombre||"").replace("-OTC","")}
+                    {(a.nombre||"").includes("OTC") && (
+                      <span style={{ fontSize:8, color:"rgba(255,255,255,0.25)", marginLeft:3 }}>OTC</span>
+                    )}
+                  </span>
+                  <span style={{ fontSize:11, fontWeight:700, fontFamily:"monospace",
+                                 color: isOpen ? C.gold : a.califica ? C.win : "rgba(255,255,255,0.3)" }}>
+                    {Number(a.payout).toFixed(1)}%
+                  </span>
+                  {a.califica && !isOpen && <span style={{ fontSize:9 }}>✓</span>}
+                  {isOpen && <span style={{ fontSize:9, color:C.gold }}>▼</span>}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ── Gráfico inline ── */}
+        {activoChart && (
+          <div style={{ marginTop:12, borderRadius:10, overflow:"hidden", position:"relative",
+                        border:"1px solid rgba(255,196,0,0.2)", background:"#0d0d16" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+                          padding:"6px 12px", background:"rgba(255,196,0,0.06)",
+                          borderBottom:"1px solid rgba(255,196,0,0.15)" }}>
+              <span style={{ fontSize:12, fontWeight:700, color:C.gold }}>
+                {activoChart.nombre.replace("-OTC","")}
+                {activoChart.nombre.includes("OTC") && <span style={{ fontSize:9, color:"rgba(255,255,255,0.3)", marginLeft:4 }}>OTC</span>}
+                <span style={{ fontSize:10, fontWeight:400, color:"rgba(255,255,255,0.4)", marginLeft:8 }}>
+                  · {Number(activoChart.payout).toFixed(1)}% payout · velas 1 min · SMA 3 / SMA 50
+                </span>
+              </span>
+              <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                <button
+                  onClick={() => openPopup(activoChart)}
+                  style={{ background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)",
+                           borderRadius:5, color:"rgba(255,255,255,0.5)", fontSize:10, padding:"2px 8px", cursor:"pointer" }}>
+                  ↗ ventana
+                </button>
+                <button
+                  onClick={() => setActivoChart(null)}
+                  style={{ background:"rgba(255,0,0,0.08)", border:"1px solid rgba(255,0,0,0.2)",
+                           borderRadius:5, color:"#ff1744", fontSize:10, padding:"2px 8px", cursor:"pointer" }}>
+                  ✕
+                </button>
+              </div>
+            </div>
+            <iframe
+              key={chartUrl}
+              src={chartUrl}
+              style={{ width:"100%", height:380, border:"none", display:"block" }}
+              title={activoChart.nombre}
+            />
+          </div>
+        )}
+      </Card>
+  );
+}
+
+// ── TAB: LIVE ─────────────────────────────────────
+function TabLive({ stats, live }) {
+  const h = stats?.hoy || {};
+  const g = stats?.global || {};
+  const cfg = stats?.config || {};
+  const ops = h.operaciones || [];
+  const plHist = [], balHist = [];
+  let cum = 0;
+  [...ops].reverse().forEach(o => { cum += o.ganancia||0; plHist.push(cum); balHist.push(o.balance_despues||0); });
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <TradeMonitor />
+      <ScanLive />
+      {/* stat cards */}
+      <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+        {[
+          { label:"Operaciones", value: h.total_operaciones||0, sub:`${h.wins||0}W / ${h.losses||0}L / ${h.ties||0}E`, icon:"📊" },
+          { label:"P/L Hoy", value: ((h.ganancia_total||0)>=0?"+":"")+fmt$(h.ganancia_total||0), accent:(h.ganancia_total||0)>=0?C.win:C.loss, sub:<Sparkline data={plHist} color={(h.ganancia_total||0)>=0?C.win:C.loss}/>, icon:"💰" },
+          { label:"Balance", value: stats?.balance_actual != null ? fmt$(stats.balance_actual) : (ops.length ? fmt$(ops[0].balance_despues) : "—"), accent:C.purple, sub:<Sparkline data={balHist} color={C.purple}/>, icon:"🏦" },
+          { label:"Racha", value: (h.racha_actual||0)>0?`+${h.racha_actual}`:h.racha_actual||0, accent:(h.racha_actual||0)>0?C.win:(h.racha_actual||0)<0?C.loss:C.tie, sub:`Best ${h.racha_max_win||0} / Worst ${h.racha_max_loss||0}`, icon:"🔥" },
+        ].map(sc=>(
+          <Card key={sc.label} style={{ flex:"1 1 160px", minWidth:150 }}>
+            <Label>{sc.icon} {sc.label}</Label>
+            <Big color={sc.accent}>{sc.value}</Big>
+            {sc.sub && <div style={{ fontSize:11, color:"rgba(255,255,255,0.3)", marginTop:4 }}>{sc.sub}</div>}
+          </Card>
+        ))}
+      </div>
+
+      {/* winrate + martingale + config */}
+      <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+        <Card style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minWidth:150 }}>
+          <WinRing rate={h.winrate||0}/>
+          <div style={{ marginTop:8, fontSize:11, color:"rgba(255,255,255,0.3)" }}>{h.wins||0} de {h.total_operaciones||0}</div>
+        </Card>
+
+        <Card style={{ flex:"1 1 260px" }}>
+          <Label>🔄 Martingala por paso</Label>
+          {Object.entries(h.por_paso_martingala||{}).sort(([a],[b])=>+a-+b).map(([p,d])=>{
+            const mx = Math.max(...Object.values(h.por_paso_martingala||{}).map(x=>x.total),1);
+            const wr = d.total>0 ? ((d.wins/d.total)*100).toFixed(0) : 0;
+            return (
+              <div key={p} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
+                <span style={{ width:45, fontSize:10, color:"rgba(255,255,255,0.4)", textAlign:"right" }}>Paso {p}</span>
+                <div style={{ flex:1, height:14, background:"rgba(255,255,255,0.04)", borderRadius:3, overflow:"hidden", display:"flex" }}>
+                  <div style={{ width:`${(d.wins/mx)*100}%`, background:"rgba(0,230,118,0.65)", height:"100%" }}/>
+                  <div style={{ width:`${(d.losses/mx)*100}%`, background:"rgba(255,23,68,0.65)", height:"100%" }}/>
+                </div>
+                <span style={{ width:65, fontSize:10, color:"rgba(255,255,255,0.35)" }}>{d.wins}W {d.losses}L</span>
+                <span style={{ width:32, fontSize:10, color:+wr>=60?C.win:C.tie }}>{wr}%</span>
+              </div>
+            );
+          })}
+        </Card>
+
+        <Card style={{ minWidth:170 }}>
+          <Label>⚙️ Config activa</Label>
+          {[["Monto base",`$${cfg.monto_base||1}`],["Martingala",cfg.martingala?"Activa":"Off"],["Multiplicador",`x${cfg.multiplicador||2.4}`],["Máx pasos",cfg.max_pasos||6],["Payout mín",`${cfg.payout_minimo||80}%`]].map(([k,v])=>(
+            <div key={k} style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:`1px solid rgba(255,255,255,0.03)`, fontSize:12 }}>
+              <span style={{ color:"rgba(255,255,255,0.4)" }}>{k}</span>
+              <span style={{ color:"rgba(255,255,255,0.8)", fontWeight:700 }}>{v}</span>
+            </div>
+          ))}
+        </Card>
+      </div>
+
+      {/* last ops */}
+      <Card>
+        <Label>📋 Últimas operaciones de hoy</Label>
+        <Table
+          cols={[
+            { key:"id", label:"#" },
+            { key:"timestamp", label:"Hora", render:r=>fmtTs(r.timestamp) },
+            { key:"activo", label:"Activo", render:r=>(r.activo||"").replace("-OTC","") },
+            { key:"direccion", label:"Dir", render:r=><Badge text={r.direccion==="call"?"▲ CALL":"▼ PUT"} color={r.direccion==="call"?C.call:C.put}/> },
+            { key:"monto", label:"Monto", render:r=>fmt$(r.monto) },
+            { key:"payout", label:"Payout", render:r=>fmtP(r.payout) },
+            { key:"resultado", label:"Res", render:r=><Badge text={r.resultado?.toUpperCase()} color={clr(r.resultado)}/> },
+            { key:"ganancia", label:"P/L", render:r=><span style={{ color:clr(r.resultado), fontWeight:700 }}>{(r.ganancia>=0?"+":"")+fmt$(r.ganancia)}</span> },
+            { key:"paso_martingala", label:"Paso", render:r=>r.paso_martingala>1?<Badge text={`M${r.paso_martingala}`} color={C.tie}/>:"—" },
+            { key:"balance_despues", label:"Balance", render:r=>fmt$(r.balance_despues) },
+          ]}
+          rows={ops}
+          emptyMsg="Sin operaciones hoy"
+        />
+      </Card>
+    </div>
+  );
+}
+
+// ── TAB: HISTORIAL (SQLite) ───────────────────────
+function TabHistorial({ db }) {
+  const ops    = db?.operaciones || [];
+  const ciclos = db?.ciclos || [];
+  const res    = db?.resumen || {};
+
+  const resOps  = {};
+  (res.operaciones||[]).forEach(r => resOps[r.resultado]=r);
+  const resCiclos = {};
+  (res.ciclos||[]).forEach(r => resCiclos[r.resultado_final]=r);
+
+  const totalOps  = ops.length;
+  const ganancia  = ops.reduce((s,o)=>s+(o.ganancia||0), 0);
+  const wins      = ops.filter(o=>o.resultado==="win").length;
+  const wr        = totalOps ? ((wins/totalOps)*100).toFixed(1) : 0;
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      {/* resumen global */}
+      <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+        {[
+          { label:"Total operaciones", value:totalOps, icon:"📊" },
+          { label:"Win Rate global", value:`${wr}%`, accent:+wr>=60?C.win:C.tie, icon:"🎯" },
+          { label:"Ganancia total", value:(ganancia>=0?"+":"")+fmt$(ganancia), accent:ganancia>=0?C.win:C.loss, icon:"💎" },
+          { label:"Ciclos registrados", value:ciclos.length, icon:"🔄" },
+        ].map(sc=>(
+          <Card key={sc.label} style={{ flex:"1 1 150px" }}>
+            <Label>{sc.icon} {sc.label}</Label>
+            <Big color={sc.accent}>{sc.value}</Big>
+          </Card>
+        ))}
+      </div>
+
+      {/* ciclos recientes */}
+      <Card>
+        <Label>🔄 Ciclos de martingala recientes</Label>
+        <Table
+          cols={[
+            { key:"id", label:"#" },
+            { key:"timestamp_inicio", label:"Inicio", render:r=>fmtTs(r.timestamp_inicio) },
+            { key:"activo", label:"Activo", render:r=>(r.activo||"").replace("-OTC","") },
+            { key:"direccion", label:"Dir", render:r=><Badge text={r.direccion==="call"?"▲":"▼"} color={r.direccion==="call"?C.call:C.put}/> },
+            { key:"pasos_usados", label:"Pasos", render:r=><span style={{ color:r.pasos_usados>1?C.tie:C.win }}>{r.pasos_usados}</span> },
+            { key:"resultado_final", label:"Resultado", render:r=><Badge text={r.resultado_final?.toUpperCase()||"—"} color={clr(r.resultado_final)}/> },
+            { key:"ganancia_neta", label:"Neto", render:r=><span style={{ color:clr(r.resultado_final), fontWeight:700 }}>{(r.ganancia_neta>=0?"+":"")+fmt$(r.ganancia_neta)}</span> },
+            { key:"monto_inicial", label:"Monto ini", render:r=>fmt$(r.monto_inicial) },
+            { key:"monto_maximo", label:"Monto máx", render:r=><span style={{ color:r.monto_maximo>r.monto_inicial?C.tie:"inherit" }}>{fmt$(r.monto_maximo)}</span> },
+            { key:"payout_inicial", label:"Payout", render:r=>fmtP(r.payout_inicial) },
+          ]}
+          rows={ciclos}
+          emptyMsg="Sin ciclos registrados aún"
+        />
+      </Card>
+
+      {/* operaciones históricas */}
+      <Card>
+        <Label>📋 Historial de operaciones (últimas 200)</Label>
+        <Table
+          cols={[
+            { key:"id", label:"#" },
+            { key:"timestamp", label:"Fecha/Hora", render:r=>fmtTs(r.timestamp) },
+            { key:"activo", label:"Activo", render:r=>(r.activo||"").replace("-OTC","") },
+            { key:"direccion", label:"Dir", render:r=><Badge text={r.direccion==="call"?"▲ CALL":"▼ PUT"} color={r.direccion==="call"?C.call:C.put}/> },
+            { key:"monto", label:"Monto", render:r=>fmt$(r.monto) },
+            { key:"payout", label:"Payout", render:r=>fmtP(r.payout) },
+            { key:"resultado", label:"Res", render:r=><Badge text={r.resultado?.toUpperCase()||"—"} color={clr(r.resultado)}/> },
+            { key:"ganancia", label:"P/L", render:r=><span style={{ color:clr(r.resultado), fontWeight:700 }}>{(r.ganancia>=0?"+":"")+fmt$(r.ganancia)}</span> },
+            { key:"paso_martingala", label:"Paso", render:r=>r.paso_martingala>1?<Badge text={`M${r.paso_martingala}`} color={C.tie}/>:"—" },
+            { key:"balance_despues", label:"Balance", render:r=>fmt$(r.balance_despues) },
+          ]}
+          rows={ops}
+          emptyMsg="Sin operaciones en la base de datos"
+        />
+      </Card>
+    </div>
+  );
+}
+
+// ── TAB: POR ACTIVO ───────────────────────────────
+function TabActivos({ activos }) {
+  const rows = activos || [];
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+        {rows.map(a=>(
+          <Card key={a.activo} style={{ flex:"1 1 200px" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+              <div>
+                <div style={{ fontWeight:700, fontSize:14, marginBottom:2 }}>{(a.activo||"").replace("-OTC","")}</div>
+                {(a.activo||"").includes("OTC") && <span style={{ fontSize:9, color:"rgba(255,255,255,0.25)" }}>OTC</span>}
+              </div>
+              <Badge text={`${a.payout_promedio}%`} color={C.gold}/>
+            </div>
+            <div style={{ marginTop:10, display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, fontSize:12 }}>
+              <div><span style={{ color:"rgba(255,255,255,0.4)" }}>Ops: </span><span>{a.total_ops}</span></div>
+              <div><span style={{ color:"rgba(255,255,255,0.4)" }}>WR: </span><span style={{ color:+a.winrate>=60?C.win:C.tie }}>{a.winrate}%</span></div>
+              <div><span style={{ color:"rgba(255,255,255,0.4)" }}>Wins: </span><span style={{ color:C.win }}>{a.wins}</span></div>
+              <div><span style={{ color:"rgba(255,255,255,0.4)" }}>Loss: </span><span style={{ color:C.loss }}>{a.losses}</span></div>
+              <div style={{ gridColumn:"span 2" }}>
+                <span style={{ color:"rgba(255,255,255,0.4)" }}>Ganancia: </span>
+                <span style={{ color:a.ganancia_total>=0?C.win:C.loss, fontWeight:700 }}>
+                  {a.ganancia_total>=0?"+":""}{fmt$(a.ganancia_total)}
+                </span>
+              </div>
+              <div style={{ gridColumn:"span 2", fontSize:10, color:"rgba(255,255,255,0.25)" }}>Última: {fmtTs(a.ultima_op)}</div>
+            </div>
+          </Card>
+        ))}
+      </div>
+      {!rows.length && <div style={{ color:"rgba(255,255,255,0.25)", textAlign:"center", padding:60 }}>Sin datos por activo aún</div>}
+    </div>
+  );
+}
+
+// ── TAB: ESCANEOS ─────────────────────────────────
+function TabEscaneos({ escaneos }) {
+  const rows = escaneos || [];
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:4 }}>
+        <Card style={{ flex:"1 1 150px" }}><Label>📡 Escaneos totales</Label><Big>{rows.length}</Big></Card>
+        <Card style={{ flex:"1 1 150px" }}><Label>⏱️ Último escaneo</Label><div style={{ fontSize:13, color:C.blue, marginTop:4 }}>{rows.length ? fmtTs(rows[0].timestamp) : "—"}</div></Card>
+        <Card style={{ flex:"1 1 150px" }}><Label>🎯 Payout mínimo</Label><Big color={C.gold}>{rows.length ? fmtP(rows[0].payout_minimo) : "—"}</Big></Card>
+      </div>
+
+      {rows.map(sc=>(
+        <Card key={sc.id}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+            <div style={{ fontSize:13, fontWeight:700 }}>Escaneo #{sc.id} — {fmtTs(sc.timestamp)}</div>
+            <div style={{ display:"flex", gap:8 }}>
+              <Badge text={`${sc.total_calificados} calificados`} color={C.win}/>
+              <Badge text={`${sc.total_revisados} revisados`} color={C.blue}/>
+              <Badge text={`>${sc.payout_minimo}%`} color={C.gold}/>
+            </div>
+          </div>
+          {sc.activos_json && sc.activos_json.length > 0 ? (
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+              {sc.activos_json.map(a=>(
+                <div key={a.activo} style={{ background:"rgba(255,255,255,0.04)", borderRadius:8, padding:"5px 12px", fontSize:12 }}>
+                  <span style={{ color:"rgba(255,255,255,0.6)" }}>{(a.activo||"").replace("-OTC","")}</span>
+                  <span style={{ color:C.gold, fontWeight:700, marginLeft:8 }}>{fmtP(a.payout)}</span>
+                </div>
+              ))}
+            </div>
+          ) : <div style={{ fontSize:11, color:"rgba(255,255,255,0.2)" }}>Sin activos calificados</div>}
+        </Card>
+      ))}
+      {!rows.length && <div style={{ color:"rgba(255,255,255,0.25)", textAlign:"center", padding:60 }}>Sin escaneos registrados aún</div>}
+    </div>
+  );
+}
+
+// ── APP ROOT ──────────────────────────────────────
+function App() {
+  const [tab, setTab]       = useState("live");
+  const [stats, setStats]   = useState(null);
+  const [live, setLive]     = useState(false);
+  const [botActivo, setBotActivo] = useState(true);
+  const [stopping, setStopping]   = useState(false);
+  const [dbOps, setDbOps]   = useState([]);
+  const [dbCiclos, setDbCiclos] = useState([]);
+  const [dbActivos, setDbActivos] = useState([]);
+  const [dbEscaneos, setDbEscaneos] = useState([]);
+  const [dbResumen, setDbResumen]  = useState({});
+  const [lastUpdate, setLastUpdate] = useState(new Date());
+
+  const detenerBot = async () => {
+    if (!confirm("¿Detener el bot? Los trades abiertos terminarán solos.")) return;
+    setStopping(true);
+    try {
+      await fetch("/api/bot/stop", { method: "POST" });
+      setBotActivo(false);
+    } catch {}
+    setStopping(false);
+  };
+
+  // live poll (5s)
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/stats");
+        if(r.ok){ const j=await r.json(); if(j&&!j.error){ setStats(j); setLive(true); } }
+      } catch { setLive(false); }
+      setLastUpdate(new Date());
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return ()=>clearInterval(id);
+  }, []);
+
+  // bot status poll (3s)
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/bot/status");
+        if (r.ok) { const j = await r.json(); setBotActivo(j.activo); }
+      } catch {}
+    };
+    tick();
+    const id = setInterval(tick, 3000);
+    return () => clearInterval(id);
+  }, []);
+
+  // db poll (15s)
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const [ops, ciclos, activos, escaneos, resumen] = await Promise.all([
+          fetch("/api/db/operaciones?limit=200").then(r=>r.json()),
+          fetch("/api/db/ciclos?limit=100").then(r=>r.json()),
+          fetch("/api/db/activos").then(r=>r.json()),
+          fetch("/api/db/escaneos?limit=30").then(r=>r.json()),
+          fetch("/api/db/resumen").then(r=>r.json()),
+        ]);
+        setDbOps(Array.isArray(ops)?ops:[]);
+        setDbCiclos(Array.isArray(ciclos)?ciclos:[]);
+        setDbActivos(Array.isArray(activos)?activos:[]);
+        setDbEscaneos(Array.isArray(escaneos)?escaneos:[]);
+        setDbResumen(resumen||{});
+      } catch {}
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return ()=>clearInterval(id);
+  }, []);
+
+  const tabs = [
+    { key:"live",      label:"⚡ Live" },
+    { key:"historial", label:"📋 Historial" },
+    { key:"activos",   label:"📈 Por Activo" },
+    { key:"escaneos",  label:"🔍 Escaneos" },
+  ];
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, padding:"20px 16px" }}>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}`}</style>
+      <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+
+      {/* header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:22 }}>
+        <div>
+          <div style={{ fontSize:20, fontWeight:800, background:"linear-gradient(135deg,#ffc400,#ff9100)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>GOLD 4.0</div>
+          <div style={{ fontSize:10, color:"rgba(255,255,255,0.25)", marginTop:1 }}>Trading Bot Dashboard</div>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:6, background:live?"rgba(0,230,118,0.07)":"rgba(255,255,255,0.04)", border:`1px solid ${live?"rgba(0,230,118,0.2)":C.border}`, borderRadius:20, padding:"4px 12px", fontSize:11 }}>
+            <Dot live={live}/> <span style={{ color:live?C.win:"#555" }}>{live?"LIVE":"OFFLINE"}</span>
+          </div>
+          <div style={{ fontSize:10, color:"rgba(255,255,255,0.2)" }}>{lastUpdate.toLocaleTimeString("es")}</div>
+
+          {botActivo ? (
+            <button
+              onClick={detenerBot}
+              disabled={stopping}
+              style={{
+                background: stopping ? "rgba(255,23,68,0.1)" : "rgba(255,23,68,0.15)",
+                border: "1px solid rgba(255,23,68,0.4)",
+                color: "#ff1744", borderRadius: 8,
+                padding: "6px 16px", fontSize: 12, fontWeight: 700,
+                cursor: stopping ? "not-allowed" : "pointer",
+                opacity: stopping ? 0.6 : 1,
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={e => { if(!stopping) e.target.style.background="rgba(255,23,68,0.28)"; }}
+              onMouseLeave={e => { e.target.style.background="rgba(255,23,68,0.15)"; }}
+            >
+              {stopping ? "Deteniendo..." : "⏹ Detener Bot"}
+            </button>
+          ) : (
+            <div style={{ background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.1)",
+                          borderRadius:8, padding:"6px 16px", fontSize:12, color:"rgba(255,255,255,0.35)" }}>
+              ⏹ Bot detenido
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* tabs */}
+      <div style={{ display:"flex", gap:2, borderBottom:`1px solid ${C.border}`, marginBottom:20 }}>
+        {tabs.map(t=>(
+          <button key={t.key} onClick={()=>{ setTab(t.key); fetch("/api/stats").then(r=>r.json()).then(j=>{if(j&&!j.error){setStats(j);setLive(true);}}).catch(()=>{}); }} style={{ padding:"9px 18px", background:tab===t.key?"rgba(255,255,255,0.05)":"transparent", border:"none", borderBottom:tab===t.key?`2px solid ${C.gold}`:"2px solid transparent", color:tab===t.key?C.gold:"rgba(255,255,255,0.35)", fontSize:12, fontWeight:600, cursor:"pointer", borderRadius:"6px 6px 0 0", transition:"all .2s", letterSpacing:".02em" }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* content — always mounted, hidden via display to preserve state */}
+      <div style={{ display: tab==="live"      ? "block" : "none" }}><TabLive stats={stats} live={live}/></div>
+      <div style={{ display: tab==="historial" ? "block" : "none" }}><TabHistorial db={{ operaciones:dbOps, ciclos:dbCiclos, resumen:dbResumen }}/></div>
+      <div style={{ display: tab==="activos"   ? "block" : "none" }}><TabActivos activos={dbActivos}/></div>
+      <div style={{ display: tab==="escaneos"  ? "block" : "none" }}><TabEscaneos escaneos={dbEscaneos}/></div>
+
+      <div style={{ textAlign:"center", marginTop:24, fontSize:10, color:"rgba(255,255,255,0.12)", letterSpacing:".05em" }}>
+        GOLD 4.0 v3 · Live cada 5s · DB cada 15s · {live?"Datos en vivo":"Sin conexión con bot"}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary><App/></ErrorBoundary>
+);
+</script>
+</body>
+</html>
