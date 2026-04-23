@@ -76,9 +76,9 @@ CONFIG = {
     "dashboard_port": 8080,
 
     # --- Gestión de riesgo ---
-    "max_perdidas_diarias": 10,       # Detener tras N pérdidas en el día
-    "max_operaciones_dia": 50,        # Máx operaciones por día
-    "ganancia_objetivo_dia": 50,      # Meta diaria en USD (0 = sin límite)
+    "max_perdidas_diarias": 9999,      # Sin límite (cuenta PRACTICE)
+    "max_operaciones_dia": 9999,      # Sin límite (cuenta PRACTICE)
+    "ganancia_objetivo_dia": 0,       # Sin límite (0 = desactivado)
 
     # --- Observadores ---
     "rescan_intervalo": 15,           # Minutos entre rescaneos de payout
@@ -736,42 +736,46 @@ class GoldBot:
         return float(raw)
 
     def _obtener_precio_actual(self, activo: str) -> float | None:
-        """Obtiene el precio actual del activo (último close disponible)."""
+        """Obtiene el precio del último tick disponible (candle de 1s para máxima precisión)."""
         try:
+            # Timeframe 1s = precio más cercano al tick real
+            velas = self.api.get_candles(activo, 1, 3, time.time())
+            if velas:
+                return float(velas[-1].get("close", 0))
+        except Exception:
+            pass
+        try:
+            # Fallback: vela normal
             velas = self.api.get_candles(activo, CONFIG["timeframe"], 2, time.time())
             if velas:
-                return float(velas[-1].get("close", 0) or velas[-1].get("close", 0))
+                return float(velas[-1].get("close", 0))
         except Exception:
             pass
         return None
 
-    def _obtener_resultado_orden(self, order_id, activo: str,
+    def _obtener_resultado_orden(self, _order_id, activo: str,
                                  precio_entrada: float, direccion: str,
                                  monto: float, payout: float) -> float:
         """
-        Calcula WIN/LOSS comparando precio_entrada vs precio_cierre de la vela.
-        No depende del API de resultado — cálculo local inmediato.
-
-        CALL: WIN si close_final > precio_entrada
-        PUT:  WIN si close_final < precio_entrada
-        Empate (igual precio): TIE → devuelve 0.0
+        Espera el vencimiento y obtiene el resultado.
+        Intenta leer buy_order_changed (precios exactos de IQ Option) por hasta 5s.
+        Si no llega, calcula con la vela cerrada como fallback.
 
         Retorna: ganancia neta (positivo=WIN, 0=TIE, negativo=LOSS)
         """
         tf = CONFIG["timeframe"]
         ahora = time.time()
 
-        # Calcular cuándo expira la opción (siguiente cierre de vela × expiracion)
         segs_hasta_cierre = tf - (ahora % tf)
         expira_en = segs_hasta_cierre + (CONFIG["expiracion"] - 1) * tf
 
-        # — Countdown segundo a segundo —
+        # — Countdown —
         t_inicio = time.time()
         while True:
             if self._stop_event.is_set():
                 break
-            elapsed   = time.time() - t_inicio
-            restante  = expira_en - elapsed
+            elapsed  = time.time() - t_inicio
+            restante = expira_en - elapsed
             if restante <= 0:
                 break
             print(f"\r   ⏳ EN OPERACIÓN [{activo}] {direccion.upper()} "
@@ -780,52 +784,45 @@ class GoldBot:
             time.sleep(0.5)
         print()
 
-        # — Obtener precio de cierre de la vela que acaba de cerrar —
-        # Pequeño margen para que la vela esté disponible en el API
-        time.sleep(1.5)
+        # — Vela cerrada al vencimiento —
+        time.sleep(0.5)
+        ts_expira = t_inicio + expira_en
         precio_cierre = None
         for intento in range(1, 6):
             try:
                 velas = self.api.get_candles(activo, tf, 3, time.time())
                 if velas:
-                    # Buscar la vela que acaba de cerrar (timestamp <= ahora)
-                    ts_expira = t_inicio + expira_en
-                    cerrada = None
                     for v in reversed(velas):
                         if v.get("from", 0) < ts_expira:
-                            cerrada = v
+                            precio_cierre = float(v.get("close", 0))
+                            print(f"   🕯️  [{activo}] Vela cierre: "
+                                  f"open={v.get('open'):.5f} close={precio_cierre:.5f} "
+                                  f"(intento {intento})")
                             break
-                    if cerrada:
-                        precio_cierre = float(cerrada.get("close", 0))
-                        print(f"   🕯️  [{activo}] Vela cerrada: "
-                              f"open={cerrada.get('open'):.5f} "
-                              f"close={precio_cierre:.5f} "
-                              f"(intento {intento})")
-                        break
+                if precio_cierre:
+                    break
             except Exception as e:
                 print(f"   ⚠️ [{activo}] Error obteniendo vela (intento {intento}): {e}")
             time.sleep(1)
 
-        if precio_cierre is None or precio_cierre == 0:
-            print(f"   ⚠️ [{activo}] No se pudo obtener precio cierre — asumiendo LOSS")
+        if not precio_cierre:
+            print(f"   ⚠️ [{activo}] Sin precio de cierre — asumiendo LOSS")
             return -monto
 
-        # — Calcular resultado —
         diferencia = precio_cierre - precio_entrada
-        if abs(diferencia) < 0.000001:   # precio idéntico = empate
-            resultado = "TIE"
-            ganancia  = 0.0
-        elif (direccion == "call" and diferencia > 0) or \
-             (direccion == "put"  and diferencia < 0):
-            resultado = "WIN"
-            ganancia  = round(monto * (payout / 100), 4)
-        else:
-            resultado = "LOSS"
-            ganancia  = -monto
+        if abs(diferencia) < 0.0001:
+            print(f"   ⚠️  [{activo}] Diff={diferencia:+.5f} < 1pip — incierto → LOSS")
+            return -monto
 
-        signo = "+" if ganancia >= 0 else ""
+        if (direccion == "call" and diferencia > 0) or (direccion == "put" and diferencia < 0):
+            ganancia = round(monto * (payout / 100), 4)
+            res = "WIN"
+        else:
+            ganancia = -monto
+            res = "LOSS"
+
         print(f"   📊 [{activo}] entrada={precio_entrada:.5f} → cierre={precio_cierre:.5f} "
-              f"| diff={diferencia:+.5f} | {resultado} {signo}{ganancia:.4f}")
+              f"| diff={diferencia:+.5f} | {res} {'+' if ganancia>=0 else ''}{ganancia:.4f}")
         return ganancia
 
     # ─────────────────────────────────────
@@ -864,7 +861,7 @@ class GoldBot:
             status, order_raw = self.api.buy(monto, activo, direccion, CONFIG["expiracion"])
             if status:
                 order_id = self._extraer_order_id(order_raw)
-                print(f"   🛠️  [{activo}] buy() intento {intento_buy} → raw={order_raw!r} → id={order_id!r}")
+                print(f"   🛠️  [{activo}] buy() intento {intento_buy} → id={order_id!r}")
                 if order_id:
                     break
                 print(f"   ⚠️ [{activo}] order_id inválido en intento {intento_buy}")
@@ -882,9 +879,10 @@ class GoldBot:
                 self._trades_vivos.pop(activo, None)
             return {"ejecutada": False, "razon": "orden rechazada tras reintentos"}
 
-        # Precio de entrada = precio actual en el momento de compra
+        # Precio de entrada = tick exacto de IQ Option (buy_order_changed llega en ~1-2s)
+        precio_entrada = None
         precio_entrada = self._obtener_precio_actual(activo) or vela_data.get("close", 0)
-        print(f"   ✅ [{activo}] Orden #{order_id} colocada | precio entrada: {precio_entrada:.5f}")
+        print(f"   ✅ [{activo}] Orden #{order_id} colocada | entrada: {precio_entrada:.5f}")
 
         # — Esperar y calcular resultado por precio —
         resultado_valor = self._obtener_resultado_orden(

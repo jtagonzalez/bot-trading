@@ -1,30 +1,30 @@
 {
   "hoy": {
     "fecha": "2026-04-23",
-    "total_operaciones": 41,
-    "wins": 18,
-    "losses": 10,
+    "total_operaciones": 147,
+    "wins": 56,
+    "losses": 78,
     "ties": 13,
-    "winrate": 43.90243902439025,
-    "ganancia_total": 51.98,
-    "racha_actual": 1,
+    "winrate": 38.095238095238095,
+    "ganancia_total": -193.05,
+    "racha_actual": -1,
     "racha_max_win": 12,
-    "racha_max_loss": 3,
+    "racha_max_loss": 8,
     "por_activo": {
       "AUDNZD-OTC": {
-        "wins": 0,
+        "wins": 1,
         "losses": 1,
-        "ganancia": -1.0
+        "ganancia": -0.16000000000000003
       },
       "EURNZD-OTC": {
-        "wins": 1,
+        "wins": 2,
         "losses": 0,
-        "ganancia": 4.42
+        "ganancia": 5.26
       },
       "DASHUSD-OTC": {
-        "wins": 1,
-        "losses": 0,
-        "ganancia": 1.84
+        "wins": 2,
+        "losses": 1,
+        "ganancia": 2.856
       },
       "SHIBUSD-OTC": {
         "wins": 1,
@@ -32,9 +32,9 @@
         "ganancia": 1.84
       },
       "LABUBUUSD-OTC": {
-        "wins": 1,
-        "losses": 0,
-        "ganancia": 10.6
+        "wins": 2,
+        "losses": 2,
+        "ganancia": 12.0384
       },
       "XNGUSD-OTC": {
         "wins": 1,
@@ -63,8 +63,8 @@
       },
       "SANDUSD-OTC": {
         "wins": 1,
-        "losses": 0,
-        "ganancia": 4.42
+        "losses": 1,
+        "ganancia": 3.42
       },
       "SP35-OTC": {
         "wins": 1,
@@ -88,8 +88,8 @@
       },
       "ORDIUSD-OTC": {
         "wins": 1,
-        "losses": 2,
-        "ganancia": 1.4384000000000001
+        "losses": 3,
+        "ganancia": 0.4384000000000001
       },
       "STXUSD-OTC": {
         "wins": 1,
@@ -110,401 +110,576 @@
         "wins": 1,
         "losses": 1,
         "ganancia": 1.016
+      },
+      "USDCAD-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "NFLX/AMZN-OTC": {
+        "wins": 0,
+        "losses": 1,
+        "ganancia": -1.0
+      },
+      "TRUMPUSD-OTC": {
+        "wins": 1,
+        "losses": 5,
+        "ganancia": 10.729200000000006
+      },
+      "ALIBABA-OTC": {
+        "wins": 1,
+        "losses": 3,
+        "ganancia": 2.4488000000000003
+      },
+      "META/GOOGLE-OTC": {
+        "wins": 0,
+        "losses": 2,
+        "ganancia": -3.4
+      },
+      "US30/JP225-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "USDINR-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "XAUUSD-OTC": {
+        "wins": 1,
+        "losses": 2,
+        "ganancia": 1.4384000000000001
+      },
+      "USDTRY-OTC": {
+        "wins": 2,
+        "losses": 5,
+        "ganancia": 5.907200000000001
+      },
+      "WIFUSD-OTC": {
+        "wins": 1,
+        "losses": 3,
+        "ganancia": -2.384
+      },
+      "JPYTHB-OTC": {
+        "wins": 2,
+        "losses": 0,
+        "ganancia": 1.68
+      },
+      "XAU/XAG-OTC": {
+        "wins": 2,
+        "losses": 1,
+        "ganancia": 1.8559999999999999
+      },
+      "XAGUSD-OTC": {
+        "wins": 1,
+        "losses": 1,
+        "ganancia": 1.016
+      },
+      "GBPUSD-OTC": {
+        "wins": 0,
+        "losses": 1,
+        "ganancia": -1.0
+      },
+      "AUDUSD-OTC": {
+        "wins": 0,
+        "losses": 1,
+        "ganancia": -1.0
+      },
+      "GBPAUD-OTC": {
+        "wins": 1,
+        "losses": 3,
+        "ganancia": 2.4488000000000003
+      },
+      "USOUSD-OTC": {
+        "wins": 2,
+        "losses": 0,
+        "ganancia": 1.68
+      },
+      "NZDCHF-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "EURGBP-OTC": {
+        "wins": 2,
+        "losses": 1,
+        "ganancia": 1.8559999999999999
+      },
+      "SNDK-OTC": {
+        "wins": 1,
+        "losses": 4,
+        "ganancia": 4.891200000000001
+      },
+      "MORSTAN-OTC": {
+        "wins": 1,
+        "losses": 1,
+        "ganancia": 1.016
+      },
+      "NVDA-OTC": {
+        "wins": 2,
+        "losses": 3,
+        "ganancia": 3.2888
+      },
+      "AIG-OTC": {
+        "wins": 1,
+        "losses": 1,
+        "ganancia": 1.016
+      },
+      "JPM-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "US30-OTC": {
+        "wins": 1,
+        "losses": 3,
+        "ganancia": 2.4488000000000003
+      },
+      "BCHUSD-OTC": {
+        "wins": 1,
+        "losses": 2,
+        "ganancia": 1.4384000000000001
+      },
+      "USDZAR-OTC": {
+        "wins": 1,
+        "losses": 3,
+        "ganancia": 2.4488000000000003
+      },
+      "DOTUSD-OTC": {
+        "wins": 0,
+        "losses": 6,
+        "ganancia": -135.79
+      },
+      "JXY": {
+        "wins": 1,
+        "losses": 1,
+        "ganancia": 1.016
+      },
+      "NEARUSD-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "JP225-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "EURCAD-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
+      },
+      "NZDJPY-OTC": {
+        "wins": 0,
+        "losses": 6,
+        "ganancia": -135.79
+      },
+      "GRTUSD-OTC": {
+        "wins": 0,
+        "losses": 4,
+        "ganancia": -22.98
+      },
+      "FLOKIUSD-OTC": {
+        "wins": 1,
+        "losses": 0,
+        "ganancia": 0.84
       }
     },
     "por_paso_martingala": {
       "1": {
-        "wins": 9,
-        "losses": 6,
-        "total": 21
+        "wins": 27,
+        "losses": 36,
+        "total": 69
       },
       "2": {
-        "wins": 4,
-        "losses": 3,
-        "total": 10
+        "wins": 13,
+        "losses": 19,
+        "total": 35
       },
       "3": {
-        "wins": 4,
-        "losses": 1,
-        "total": 6
+        "wins": 7,
+        "losses": 12,
+        "total": 20
       },
       "4": {
-        "wins": 1,
-        "losses": 0,
-        "total": 2
+        "wins": 6,
+        "losses": 6,
+        "total": 13
       },
       "5": {
-        "wins": 0,
-        "losses": 0,
-        "total": 1
+        "wins": 2,
+        "losses": 3,
+        "total": 6
       },
       "6": {
-        "wins": 0,
-        "losses": 0,
-        "total": 1
+        "wins": 1,
+        "losses": 2,
+        "total": 4
       }
     },
     "operaciones": [
       {
-        "id": 22,
-        "timestamp": "2026-04-23T12:30:30.606847",
-        "activo": "GBPCAD-OTC",
-        "direccion": "put",
-        "monto": 2.4,
-        "payout": 84.0,
-        "resultado": "tie",
-        "ganancia": 0.0,
-        "paso_martingala": 2,
-        "balance_despues": 9742.76,
-        "sma3": 1.76649,
-        "sma50": 1.76934,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.275,
-        "close": 1.76452
-      },
-      {
-        "id": 23,
-        "timestamp": "2026-04-23T12:31:30.656406",
-        "activo": "GBPCAD-OTC",
-        "direccion": "put",
-        "monto": 5.76,
-        "payout": 84.0,
-        "resultado": "tie",
-        "ganancia": 0,
-        "paso_martingala": 3,
-        "balance_despues": 9737,
-        "sma3": 1.76649,
-        "sma50": 1.76934,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.275,
-        "close": 1.76452
-      },
-      {
-        "id": 24,
-        "timestamp": "2026-04-23T12:32:30.542071",
-        "activo": "GBPCAD-OTC",
-        "direccion": "put",
-        "monto": 13.82,
-        "payout": 84.0,
-        "resultado": "tie",
-        "ganancia": 0.0,
-        "paso_martingala": 4,
-        "balance_despues": 9723.18,
-        "sma3": 1.76649,
-        "sma50": 1.76934,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.275,
-        "close": 1.76452
-      },
-      {
-        "id": 25,
-        "timestamp": "2026-04-23T12:33:30.609717",
-        "activo": "GBPCAD-OTC",
-        "direccion": "put",
-        "monto": 33.18,
-        "payout": 84.0,
-        "resultado": "tie",
-        "ganancia": 0,
-        "paso_martingala": 5,
-        "balance_despues": 9690,
-        "sma3": 1.76649,
-        "sma50": 1.76934,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.275,
-        "close": 1.76452
-      },
-      {
-        "id": 26,
-        "timestamp": "2026-04-23T12:34:30.591964",
-        "activo": "GBPCAD-OTC",
-        "direccion": "put",
-        "monto": 79.63,
-        "payout": 84.0,
-        "resultado": "tie",
-        "ganancia": 0.0,
-        "paso_martingala": 6,
-        "balance_despues": 9610.37,
-        "sma3": 1.76649,
-        "sma50": 1.76934,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.275,
-        "close": 1.76452
-      },
-      {
-        "id": 27,
-        "timestamp": "2026-04-23T12:42:02.382174",
-        "activo": "ORDIUSD-OTC",
-        "direccion": "call",
-        "monto": 1.0,
-        "payout": 84.0,
-        "resultado": "loss",
-        "ganancia": -1.0,
-        "paso_martingala": 1,
-        "balance_despues": 9608.37,
-        "sma3": 4.50268,
-        "sma50": 4.43678,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.313,
-        "close": 4.52264
-      },
-      {
-        "id": 28,
-        "timestamp": "2026-04-23T12:43:02.012472",
-        "activo": "ORDIUSD-OTC",
-        "direccion": "call",
-        "monto": 2.4,
-        "payout": 84.0,
-        "resultado": "loss",
-        "ganancia": -2.4,
-        "paso_martingala": 2,
-        "balance_despues": 9605.97,
-        "sma3": 4.50268,
-        "sma50": 4.43678,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.313,
-        "close": 4.52264
-      },
-      {
-        "id": 29,
-        "timestamp": "2026-04-23T12:44:02.451722",
-        "activo": "ORDIUSD-OTC",
-        "direccion": "call",
-        "monto": 5.76,
-        "payout": 84.0,
-        "resultado": "win",
-        "ganancia": 4.8384,
-        "paso_martingala": 3,
-        "balance_despues": 9600.21,
-        "sma3": 4.50268,
-        "sma50": 4.43678,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.313,
-        "close": 4.52264
-      },
-      {
-        "id": 30,
-        "timestamp": "2026-04-23T12:46:02.298994",
-        "activo": "STXUSD-OTC",
-        "direccion": "call",
-        "monto": 1.0,
-        "payout": 84.0,
-        "resultado": "loss",
-        "ganancia": -1.0,
-        "paso_martingala": 1,
-        "balance_despues": 9609.81,
-        "sma3": 0.2465,
-        "sma50": 0.23367,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.492,
-        "close": 0.24783
-      },
-      {
-        "id": 31,
-        "timestamp": "2026-04-23T12:47:02.153349",
-        "activo": "STXUSD-OTC",
-        "direccion": "call",
-        "monto": 2.4,
-        "payout": 84.0,
-        "resultado": "loss",
-        "ganancia": -2.4,
-        "paso_martingala": 2,
-        "balance_despues": 9607.41,
-        "sma3": 0.2465,
-        "sma50": 0.23367,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.492,
-        "close": 0.24783
-      },
-      {
-        "id": 32,
-        "timestamp": "2026-04-23T12:48:02.572413",
-        "activo": "STXUSD-OTC",
-        "direccion": "call",
-        "monto": 5.76,
-        "payout": 84.0,
-        "resultado": "win",
-        "ganancia": 4.8384,
-        "paso_martingala": 3,
-        "balance_despues": 9612.25,
-        "sma3": 0.2465,
-        "sma50": 0.23367,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.492,
-        "close": 0.24783
-      },
-      {
-        "id": 33,
-        "timestamp": "2026-04-23T12:50:02.426467",
-        "activo": "BIDU-OTC",
+        "id": 128,
+        "timestamp": "2026-04-23T17:16:06.242410",
+        "activo": "JXY",
         "direccion": "put",
         "monto": 1.0,
         "payout": 84.0,
         "resultado": "loss",
         "ganancia": -1.0,
         "paso_martingala": 1,
-        "balance_despues": 9611.25,
-        "sma3": 101.70483,
-        "sma50": 103.80682,
+        "balance_despues": 9462.08,
+        "sma3": 62.81558,
+        "sma50": 62.81791,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.805,
-        "close": 101.3615
+        "ratio_mechas": 0.575,
+        "close": 62.81415
       },
       {
-        "id": 34,
-        "timestamp": "2026-04-23T12:51:02.175386",
-        "activo": "BIDU-OTC",
+        "id": 129,
+        "timestamp": "2026-04-23T17:17:06.076360",
+        "activo": "JXY",
         "direccion": "put",
         "monto": 2.4,
         "payout": 84.0,
         "resultado": "win",
         "ganancia": 2.016,
         "paso_martingala": 2,
-        "balance_despues": 9613.27,
-        "sma3": 101.70483,
-        "sma50": 103.80682,
+        "balance_despues": 9464.12,
+        "sma3": 62.81558,
+        "sma50": 62.81791,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.805,
-        "close": 101.3615
+        "ratio_mechas": 0.575,
+        "close": 62.81415
       },
       {
-        "id": 35,
-        "timestamp": "2026-04-23T12:53:02.206329",
-        "activo": "COFFEE-OTC",
+        "id": 130,
+        "timestamp": "2026-04-23T17:19:06.593667",
+        "activo": "XAU/XAG-OTC",
         "direccion": "call",
         "monto": 1.0,
         "payout": 84.0,
         "resultado": "loss",
         "ganancia": -1.0,
         "paso_martingala": 1,
-        "balance_despues": 9612.27,
-        "sma3": 306.06991,
-        "sma50": 303.34528,
+        "balance_despues": 9463.12,
+        "sma3": 63.88811,
+        "sma50": 63.53378,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.609,
-        "close": 306.35136
+        "ratio_mechas": 0.366,
+        "close": 63.97823
       },
       {
-        "id": 36,
-        "timestamp": "2026-04-23T12:54:02.393066",
-        "activo": "COFFEE-OTC",
+        "id": 131,
+        "timestamp": "2026-04-23T17:20:06.289646",
+        "activo": "XAU/XAG-OTC",
         "direccion": "call",
         "monto": 2.4,
         "payout": 84.0,
-        "resultado": "loss",
-        "ganancia": -2.4,
-        "paso_martingala": 2,
-        "balance_despues": 9609.87,
-        "sma3": 306.06991,
-        "sma50": 303.34528,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.609,
-        "close": 306.35136
-      },
-      {
-        "id": 37,
-        "timestamp": "2026-04-23T12:55:02.314141",
-        "activo": "COFFEE-OTC",
-        "direccion": "call",
-        "monto": 5.76,
-        "payout": 84.0,
-        "resultado": "loss",
-        "ganancia": -5.76,
-        "paso_martingala": 3,
-        "balance_despues": 9604.11,
-        "sma3": 306.06991,
-        "sma50": 303.34528,
-        "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.609,
-        "close": 306.35136
-      },
-      {
-        "id": 38,
-        "timestamp": "2026-04-23T12:56:02.105815",
-        "activo": "COFFEE-OTC",
-        "direccion": "call",
-        "monto": 13.82,
-        "payout": 84.0,
         "resultado": "win",
-        "ganancia": 11.6088,
-        "paso_martingala": 4,
-        "balance_despues": 9590.29,
-        "sma3": 306.06991,
-        "sma50": 303.34528,
+        "ganancia": 2.016,
+        "paso_martingala": 2,
+        "balance_despues": 9465.14,
+        "sma3": 63.88811,
+        "sma50": 63.53378,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.609,
-        "close": 306.35136
+        "ratio_mechas": 0.366,
+        "close": 63.97823
       },
       {
-        "id": 39,
-        "timestamp": "2026-04-23T12:58:02.560919",
-        "activo": "CHFJPY-OTC",
+        "id": 132,
+        "timestamp": "2026-04-23T17:23:01.405711",
+        "activo": "NEARUSD-OTC",
         "direccion": "put",
         "monto": 1.0,
         "payout": 84.0,
         "resultado": "win",
         "ganancia": 0.84,
         "paso_martingala": 1,
-        "balance_despues": 9616.56,
-        "sma3": 201.97883,
-        "sma50": 201.9955,
+        "balance_despues": 9464.14,
+        "sma3": 1.35449,
+        "sma50": 1.37291,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 1.233,
-        "close": 201.9545
+        "ratio_mechas": 1.81,
+        "close": 1.35139
       },
       {
-        "id": 40,
-        "timestamp": "2026-04-23T13:00:02.399214",
-        "activo": "MANAUSD-OTC",
+        "id": 133,
+        "timestamp": "2026-04-23T17:25:01.086561",
+        "activo": "JP225-OTC",
+        "direccion": "put",
+        "monto": 1.0,
+        "payout": 84.0,
+        "resultado": "win",
+        "ganancia": 0.84,
+        "paso_martingala": 1,
+        "balance_despues": 9464.98,
+        "sma3": 61133.41104,
+        "sma50": 61308.34999,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.315,
+        "close": 61090.03577
+      },
+      {
+        "id": 134,
+        "timestamp": "2026-04-23T17:27:01.368712",
+        "activo": "EURCAD-OTC",
+        "direccion": "put",
+        "monto": 1.0,
+        "payout": 84.0,
+        "resultado": "win",
+        "ganancia": 0.84,
+        "paso_martingala": 1,
+        "balance_despues": 9465.82,
+        "sma3": 1.58676,
+        "sma50": 1.58682,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.526,
+        "close": 1.58657
+      },
+      {
+        "id": 135,
+        "timestamp": "2026-04-23T17:29:00.987630",
+        "activo": "NZDJPY-OTC",
         "direccion": "call",
         "monto": 1.0,
         "payout": 84.0,
         "resultado": "loss",
         "ganancia": -1.0,
         "paso_martingala": 1,
-        "balance_despues": 9615.56,
-        "sma3": 0.09732,
-        "sma50": 0.09531,
+        "balance_despues": 9466.66,
+        "sma3": 93.2117,
+        "sma50": 92.98507,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.365,
-        "close": 0.0977
+        "ratio_mechas": 0.202,
+        "close": 93.2469
       },
       {
-        "id": 41,
-        "timestamp": "2026-04-23T13:01:02.263924",
-        "activo": "MANAUSD-OTC",
+        "id": 136,
+        "timestamp": "2026-04-23T17:30:01.104335",
+        "activo": "NZDJPY-OTC",
         "direccion": "call",
         "monto": 2.4,
         "payout": 84.0,
-        "resultado": "win",
-        "ganancia": 2.016,
+        "resultado": "loss",
+        "ganancia": -2.4,
         "paso_martingala": 2,
-        "balance_despues": 9617.58,
-        "sma3": 0.09732,
-        "sma50": 0.09531,
+        "balance_despues": 9464.26,
+        "sma3": 93.2117,
+        "sma50": 92.98507,
         "pct_cuerpo": 1.0,
-        "ratio_mechas": 0.365,
-        "close": 0.0977
+        "ratio_mechas": 0.202,
+        "close": 93.2469
+      },
+      {
+        "id": 137,
+        "timestamp": "2026-04-23T17:31:01.422990",
+        "activo": "NZDJPY-OTC",
+        "direccion": "call",
+        "monto": 5.76,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -5.76,
+        "paso_martingala": 3,
+        "balance_despues": 9458.5,
+        "sma3": 93.2117,
+        "sma50": 92.98507,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.202,
+        "close": 93.2469
+      },
+      {
+        "id": 138,
+        "timestamp": "2026-04-23T17:32:01.037789",
+        "activo": "NZDJPY-OTC",
+        "direccion": "call",
+        "monto": 13.82,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -13.82,
+        "paso_martingala": 4,
+        "balance_despues": 9444.68,
+        "sma3": 93.2117,
+        "sma50": 92.98507,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.202,
+        "close": 93.2469
+      },
+      {
+        "id": 139,
+        "timestamp": "2026-04-23T17:33:01.422828",
+        "activo": "NZDJPY-OTC",
+        "direccion": "call",
+        "monto": 33.18,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -33.18,
+        "paso_martingala": 5,
+        "balance_despues": 9411.5,
+        "sma3": 93.2117,
+        "sma50": 92.98507,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.202,
+        "close": 93.2469
+      },
+      {
+        "id": 140,
+        "timestamp": "2026-04-23T17:34:01.140469",
+        "activo": "NZDJPY-OTC",
+        "direccion": "call",
+        "monto": 79.63,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -79.63,
+        "paso_martingala": 6,
+        "balance_despues": 9331.87,
+        "sma3": 93.2117,
+        "sma50": 92.98507,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.202,
+        "close": 93.2469
+      },
+      {
+        "id": 141,
+        "timestamp": "2026-04-23T17:36:01.459506",
+        "activo": "NVDA-OTC",
+        "direccion": "call",
+        "monto": 1.0,
+        "payout": 84.0,
+        "resultado": "win",
+        "ganancia": 0.84,
+        "paso_martingala": 1,
+        "balance_despues": 9330.87,
+        "sma3": 204.27015,
+        "sma50": 203.20435,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.016,
+        "close": 204.66371
+      },
+      {
+        "id": 142,
+        "timestamp": "2026-04-23T17:38:01.309975",
+        "activo": "GRTUSD-OTC",
+        "direccion": "call",
+        "monto": 1.0,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -1.0,
+        "paso_martingala": 1,
+        "balance_despues": 9331.71,
+        "sma3": 0.02378,
+        "sma50": 0.02329,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 1.6,
+        "close": 0.02381
+      },
+      {
+        "id": 143,
+        "timestamp": "2026-04-23T17:39:01.162798",
+        "activo": "GRTUSD-OTC",
+        "direccion": "call",
+        "monto": 2.4,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -2.4,
+        "paso_martingala": 2,
+        "balance_despues": 9329.31,
+        "sma3": 0.02378,
+        "sma50": 0.02329,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 1.6,
+        "close": 0.02381
+      },
+      {
+        "id": 144,
+        "timestamp": "2026-04-23T17:40:01.496849",
+        "activo": "GRTUSD-OTC",
+        "direccion": "call",
+        "monto": 5.76,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -5.76,
+        "paso_martingala": 3,
+        "balance_despues": 9323.55,
+        "sma3": 0.02378,
+        "sma50": 0.02329,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 1.6,
+        "close": 0.02381
+      },
+      {
+        "id": 145,
+        "timestamp": "2026-04-23T17:41:01.147427",
+        "activo": "GRTUSD-OTC",
+        "direccion": "call",
+        "monto": 13.82,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -13.82,
+        "paso_martingala": 4,
+        "balance_despues": 9309.73,
+        "sma3": 0.02378,
+        "sma50": 0.02329,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 1.6,
+        "close": 0.02381
+      },
+      {
+        "id": 146,
+        "timestamp": "2026-04-23T17:49:01.103514",
+        "activo": "FLOKIUSD-OTC",
+        "direccion": "put",
+        "monto": 1.0,
+        "payout": 84.0,
+        "resultado": "win",
+        "ganancia": 0.84,
+        "paso_martingala": 1,
+        "balance_despues": 9308.73,
+        "sma3": 0.03293,
+        "sma50": 0.03338,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.917,
+        "close": 0.03281
+      },
+      {
+        "id": 147,
+        "timestamp": "2026-04-23T17:51:01.099338",
+        "activo": "SANDUSD-OTC",
+        "direccion": "call",
+        "monto": 1.0,
+        "payout": 84.0,
+        "resultado": "loss",
+        "ganancia": -1.0,
+        "paso_martingala": 1,
+        "balance_despues": 9309.57,
+        "sma3": 0.07489,
+        "sma50": 0.07352,
+        "pct_cuerpo": 1.0,
+        "ratio_mechas": 0.344,
+        "close": 0.07512
       }
     ]
   },
   "global": {
-    "total_operaciones": 41,
-    "wins": 18,
-    "losses": 10,
-    "winrate": 43.9,
-    "ganancia_total": 51.98,
+    "total_operaciones": 147,
+    "wins": 56,
+    "losses": 78,
+    "winrate": 38.1,
+    "ganancia_total": -193.05,
     "mejor_dia": {
       "fecha": "2026-04-23",
-      "ganancia": 51.98
+      "ganancia": -193.05
     },
     "peor_dia": {
       "fecha": "2026-04-23",
-      "ganancia": 51.98
+      "ganancia": -193.05
     },
     "dias_operados": 1,
-    "promedio_diario": 51.98
+    "promedio_diario": -193.05
   },
-  "ultima_actualizacion": "2026-04-23T13:01:02.263924",
+  "ultima_actualizacion": "2026-04-23T17:51:01.103978",
   "config": {
     "monto_base": 1,
     "martingala": true,
