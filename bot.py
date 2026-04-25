@@ -793,11 +793,10 @@ class GoldBot:
 
         self._estado_activos: dict[str, str] = {}
 
-        # Martingala flotante: estado global del ciclo en curso entre activos
-        # None = sin ciclo activo
-        # Cuando step 1 pierde, _ciclo_trade escribe aquí y el coordinador
-        # busca señal en activo diferente para el siguiente paso.
-        self._mart: dict = None
+        # Martingala flotante: lista de secuencias activas (una por P1 que perdió)
+        # Cada secuencia es un dict con su propio estado independiente.
+        # Si 3 P1 pierden en paralelo → 3 entradas en esta lista.
+        self._mart_secuencias: list = []
 
         # Pool de conexiones API (una por hilo de trading, sin buffer compartido)
         self._api_pool = ApiPool(
@@ -1281,9 +1280,9 @@ class GoldBot:
                 # LOSS en paso 1 → activar martingala flotante
                 ganancia_neta = res["ganancia"]
                 self._renombrar_captura(ruta_captura, "loss_p1")
-                print(f"   🔄 [{activo}] P1 LOSS — activando martingala flotante paso 2")
+                print(f"   🔄 [{activo}] P1 LOSS — encolando secuencia flotante paso 2")
                 with self._lock:
-                    self._mart = {
+                    self._mart_secuencias.append({
                         "ciclo_id":       ciclo_id,
                         "ts_inicio":      ts_inicio,
                         "hora_inicio":    hora_inicio,
@@ -1294,9 +1293,8 @@ class GoldBot:
                         "ganancia_neta":  ganancia_neta,
                         "activos_usados": {activo},
                         "pasos_detalle":  [paso_detalle],
-                        "vela_data_p1":   vela_data,
                         "precio_apertura":precio_apertura,
-                    }
+                    })
         finally:
             self._api_pool.release(api)
 
@@ -1627,113 +1625,128 @@ class GoldBot:
             print(f"{'─'*62}")
 
             with self._lock:
-                mart_activo = self._mart is not None
+                secuencias_activas = len(self._mart_secuencias)
 
-            # ── 4a. Martingala flotante activa → buscar señal en activo diferente ──
-            if mart_activo:
+            # ── 4a. Secuencias de martingala flotante activas ──
+            if secuencias_activas > 0:
                 with self._lock:
-                    mart = dict(self._mart)
-                    activos_usados = set(mart["activos_usados"])
+                    secuencias = [dict(s) for s in self._mart_secuencias]
 
-                paso  = mart["paso"]
-                monto = mart["monto"]
-                print(f"  🔄 MARTINGALA FLOTANTE P{paso} — buscando señal (excluidos: {activos_usados})")
+                print(f"  🔄 {secuencias_activas} secuencia(s) flotante(s) activa(s)")
 
-                paso_ejecutado = False
-                for activo_info in activos_scan:
-                    activo = activo_info["nombre"]
-                    if activo in activos_usados:
-                        continue
-                    if self._stop_event.is_set():
-                        break
-                    try:
-                        df = self.obtener_velas(activo)
-                        df = calcular_señales(df)
-                        self._guardar_cache(activo, df)
-                        vela = df.iloc[-2]
+                # Asignar un activo diferente a cada secuencia (sin repetir en esta vela)
+                activos_reservados = set()
+                tareas = []  # [(idx_seq, activo, direccion, vela_data, payout, paso, monto)]
 
-                        if vela["COMPRAR"]:
-                            direccion = "call"
-                        elif vela["VENDER"]:
-                            direccion = "put"
-                        else:
+                for idx, seq in enumerate(secuencias):
+                    excluidos = seq["activos_usados"] | activos_reservados
+                    for activo_info in activos_scan:
+                        activo = activo_info["nombre"]
+                        if activo in excluidos or self._stop_event.is_set():
                             continue
-
-                        vela_data = {
-                            "sma3":          round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
-                            "sma50":         round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
-                            "distancia_smas":round(float(vela["distancia_smas"]), 6) if not pd.isna(vela["distancia_smas"]) else 0,
-                            "pct_cuerpo":    round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
-                            "ratio_mechas":  round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
-                            "close":         round(float(vela["close"]), 5),
-                        }
-
-                        payout = self.obtener_payout_actual(activo)
-                        if payout < CONFIG["payout_minimo"]:
-                            continue
-
-                        icono = "🟢" if direccion == "call" else "🔴"
-                        print(f"\n  {icono} MART P{paso} → {activo} {direccion.upper()} ${monto:.2f} payout:{payout}%")
-
-                        res = self._ejecutar_paso_flotante(activo, direccion, vela_data, payout)
-                        paso_ejecutado = True
-
-                        paso_det = {"paso": paso, "activo": activo, "direccion": direccion,
-                                    "monto": monto, "resultado": res.get("resultado","error"),
-                                    "ganancia": round(res.get("ganancia", 0), 2)}
-
-                        with self._lock:
-                            if res.get("resultado") == "win":
-                                self._mart["ganancia_neta"] += res["ganancia"]
-                                self._mart["pasos_detalle"].append(paso_det)
-                                self._mart["monto_maximo"] = max(self._mart["monto_maximo"], monto)
-                                mart_snap = dict(self._mart)
-                                self._mart = None
+                        try:
+                            df = self.obtener_velas(activo)
+                            df = calcular_señales(df)
+                            self._guardar_cache(activo, df)
+                            vela = df.iloc[-2]
+                            if vela["COMPRAR"]:
+                                direccion = "call"
+                            elif vela["VENDER"]:
+                                direccion = "put"
                             else:
-                                self._mart["ganancia_neta"] += res.get("ganancia", 0)
-                                self._mart["pasos_detalle"].append(paso_det)
-                                self._mart["monto_maximo"] = max(self._mart["monto_maximo"], monto)
-                                self._mart["activos_usados"].add(activo)
-                                if paso >= CONFIG["max_pasos"]:
-                                    mart_snap = dict(self._mart)
-                                    self._mart = None
-                                else:
-                                    self._mart["paso"]  += 1
-                                    self._mart["monto"]  = round(monto * CONFIG["multiplicador"], 2)
-                                    mart_snap = None
+                                continue
+                            payout = self.obtener_payout_actual(activo)
+                            if payout < CONFIG["payout_minimo"]:
+                                continue
+                            vela_data = {
+                                "sma3":          round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
+                                "sma50":         round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
+                                "distancia_smas":round(float(vela["distancia_smas"]), 6) if not pd.isna(vela["distancia_smas"]) else 0,
+                                "pct_cuerpo":    round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
+                                "ratio_mechas":  round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
+                                "close":         round(float(vela["close"]), 5),
+                            }
+                            tareas.append((idx, activo, direccion, vela_data, payout,
+                                           seq["paso"], seq["monto"]))
+                            activos_reservados.add(activo)
+                            icono = "🟢" if direccion == "call" else "🔴"
+                            print(f"  {icono} SEQ[{idx}] P{seq['paso']} → {activo} {direccion.upper()} ${seq['monto']:.2f}")
+                            break
+                        except Exception as e:
+                            print(f"  ⚠️ [{activo}] Error evaluando señal flotante: {e}")
 
-                        if res.get("resultado") == "win":
-                            g = mart_snap["ganancia_neta"]
-                            self.db.cerrar_ciclo(mart_snap["ciclo_id"], "win", g,
-                                                 paso, mart_snap["monto_maximo"])
-                            activos_lista = [p["activo"] for p in mart_snap["pasos_detalle"]]
-                            self._guardar_ciclo_flotante_db(
-                                mart_snap["ciclo_id"], mart_snap["ts_inicio"],
-                                paso, "win", g,
-                                mart_snap["monto_inicial"], mart_snap["monto_maximo"],
-                                mart_snap["pasos_detalle"], activos_lista)
-                            print(f"\n  ✅ CICLO FLOTANTE GANADO en P{paso} | Neto: ${g:+.2f}")
-                        elif mart_snap is not None:
-                            g = mart_snap["ganancia_neta"]
-                            self.db.cerrar_ciclo(mart_snap["ciclo_id"], "loss", g,
-                                                 paso, mart_snap["monto_maximo"])
-                            activos_lista = [p["activo"] for p in mart_snap["pasos_detalle"]]
-                            self._guardar_ciclo_flotante_db(
-                                mart_snap["ciclo_id"], mart_snap["ts_inicio"],
-                                paso, "loss", g,
-                                mart_snap["monto_inicial"], mart_snap["monto_maximo"],
-                                mart_snap["pasos_detalle"], activos_lista)
-                            print(f"\n  💀 CICLO FLOTANTE PERDIDO — {paso} pasos agotados | Neto: ${g:+.2f}")
-                        else:
-                            print(f"  🔄 P{paso} LOSS — esperando siguiente vela para P{paso+1}")
+                # Ejecutar todas las tareas en paralelo y recoger resultados
+                resultados = {}  # idx → (activo, res)
 
-                        ultimo_scan = 0
-                        break
-                    except Exception as e:
-                        print(f"  ⚠️ [{activo}] Error en mart flotante: {e}")
+                def _ejecutar_tarea(idx, activo, direccion, vela_data, payout, paso, monto):
+                    api = self._api_pool.acquire()
+                    try:
+                        res = self._ejecutar_paso(activo, direccion, monto, payout,
+                                                   paso, secuencias[idx]["ciclo_id"],
+                                                   vela_data, api=api)
+                        try:
+                            bal = api.get_balance()
+                            print(f"   💰 [{activo}] Balance: ${bal:.2f}")
+                        except Exception:
+                            pass
+                        resultados[idx] = (activo, res)
+                    finally:
+                        self._api_pool.release(api)
 
-                if not paso_ejecutado:
-                    print(f"  ⏳ Sin señal para martingala P{paso} esta vela — esperando próxima...")
+                hilos = []
+                for tarea in tareas:
+                    h = threading.Thread(target=_ejecutar_tarea, args=tarea, daemon=True)
+                    h.start()
+                    hilos.append(h)
+                for h in hilos:
+                    h.join()
+
+                # Actualizar secuencias según resultados
+                nuevas_secuencias = []
+                for idx, seq in enumerate(secuencias):
+                    if idx not in resultados:
+                        nuevas_secuencias.append(seq)  # sin señal esta vela, reintentar próxima
+                        print(f"  ⏳ SEQ[{idx}] P{seq['paso']} sin señal — reintenta próxima vela")
+                        continue
+
+                    activo, res = resultados[idx]
+                    paso  = seq["paso"]
+                    monto = seq["monto"]
+                    paso_det = {"paso": paso, "activo": activo, "direccion": res.get("direccion", "?"),
+                                "monto": monto, "resultado": res.get("resultado", "error"),
+                                "ganancia": round(res.get("ganancia", 0), 2)}
+                    seq["pasos_detalle"].append(paso_det)
+                    seq["ganancia_neta"] += res.get("ganancia", 0)
+                    seq["monto_maximo"]   = max(seq["monto_maximo"], monto)
+
+                    if res.get("resultado") == "win":
+                        g = seq["ganancia_neta"]
+                        self.db.cerrar_ciclo(seq["ciclo_id"], "win", g, paso, seq["monto_maximo"])
+                        activos_lista = [p["activo"] for p in seq["pasos_detalle"]]
+                        self._guardar_ciclo_flotante_db(
+                            seq["ciclo_id"], seq["ts_inicio"], paso, "win", g,
+                            seq["monto_inicial"], seq["monto_maximo"],
+                            seq["pasos_detalle"], activos_lista)
+                        print(f"\n  ✅ SEQ[{idx}] GANADO en P{paso} ({activo}) | Neto: ${g:+.2f}")
+                    elif paso >= CONFIG["max_pasos"]:
+                        g = seq["ganancia_neta"]
+                        self.db.cerrar_ciclo(seq["ciclo_id"], "loss", g, paso, seq["monto_maximo"])
+                        activos_lista = [p["activo"] for p in seq["pasos_detalle"]]
+                        self._guardar_ciclo_flotante_db(
+                            seq["ciclo_id"], seq["ts_inicio"], paso, "loss", g,
+                            seq["monto_inicial"], seq["monto_maximo"],
+                            seq["pasos_detalle"], activos_lista)
+                        print(f"\n  💀 SEQ[{idx}] PERDIDO — {paso} pasos agotados | Neto: ${g:+.2f}")
+                    else:
+                        seq["paso"]  += 1
+                        seq["monto"]  = round(monto * CONFIG["multiplicador"], 2)
+                        seq["activos_usados"].add(activo)
+                        nuevas_secuencias.append(seq)
+                        print(f"  🔄 SEQ[{idx}] P{paso} LOSS — continúa P{seq['paso']} próxima vela")
+
+                with self._lock:
+                    self._mart_secuencias = nuevas_secuencias
+                ultimo_scan = 0
 
             # ── 4b. Sin martingala activa → buscar señal nueva (paso 1) ──
             else:
@@ -1742,7 +1755,7 @@ class GoldBot:
                     activo = activo_info["nombre"]
                     if self._stop_event.is_set():
                         break
-                    if señales_lanzadas >= 2:
+                    if señales_lanzadas >= self._max_paralelo:
                         break
 
                     try:
