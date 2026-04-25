@@ -26,6 +26,25 @@ import signal
 # Forzar UTF-8 en Windows para soportar emojis y caracteres especiales
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# ── Logging a archivo ──────────────────────────────────────
+class _Tee:
+    """Escribe simultáneamente en consola y en archivo de log."""
+    def __init__(self, stream, filepath):
+        self._stream = stream
+        self._file   = open(filepath, "a", encoding="utf-8", errors="replace", buffering=1)
+    def write(self, data):
+        self._stream.write(data)
+        self._file.write(data)
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
+
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_log.txt")
+sys.stdout = _Tee(sys.stdout, _log_path)
+sys.stderr = _Tee(sys.stderr, _log_path)
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -83,6 +102,15 @@ CONFIG = {
     # --- Observadores ---
     "rescan_intervalo": 15,           # Minutos entre rescaneos de payout
     "payout_minimo": 80,              # % mínimo para mantener observador activo
+}
+
+# Activos excluidos permanentemente (2+ pérdidas completas de 6 pasos)
+ACTIVOS_EXCLUIDOS = {
+    "SNDK-OTC",
+    "SANDUSD-OTC",
+    "IMXUSD-OTC",
+    "EURUSD-OTC",
+    "CHFNOK-OTC",
 }
 
 
@@ -143,15 +171,58 @@ def calcular_señales(df: pd.DataFrame) -> pd.DataFrame:
 
     umbral = CONFIG["porcentaje_cuerpo"]
 
+    # Sin cruce reciente de tendencia: en las últimas 15 velas ninguna debe tocar SMA50
+    # "tocar" = el rango (low..high) de la vela contiene el valor de SMA50
+    def sin_cruce_sma50(i):
+        if i < 1:
+            return False
+        ventana = df.iloc[max(0, i-15):i]
+        tocando = (ventana["low"] <= ventana["sma_tendencia"]) & (ventana["sma_tendencia"] <= ventana["high"])
+        return not tocando.any()
+
+    df["sin_cruce_reciente"] = pd.Series([sin_cruce_sma50(i) for i in range(len(df))], index=df.index)
+
+    # Pullback: en las 5 velas anteriores debe haber al menos 1 vela contraria
+    # CALL → al menos 1 roja (bajista) entre las 5 anteriores a la vela señal
+    # PUT  → al menos 1 verde (alcista) entre las 5 anteriores a la vela señal
+    df["pullback_call"] = pd.Series([
+        df["es_bajista"].iloc[max(0, i-5):i].any() if i >= 1 else False
+        for i in range(len(df))
+    ], index=df.index)
+    df["pullback_put"] = pd.Series([
+        df["es_alcista"].iloc[max(0, i-5):i].any() if i >= 1 else False
+        for i in range(len(df))
+    ], index=df.index)
+
+    # Sin vela dominante contraria: en las últimas 5 velas no debe haber
+    # CALL → ninguna vela roja con >50% del cuerpo por debajo de SMA3
+    # PUT  → ninguna vela verde con >50% del cuerpo por encima de SMA3
+    def sin_roja_dominante(i):
+        if i < 1:
+            return False
+        ventana = df.iloc[max(0, i-5):i]
+        return not ((ventana["es_bajista"]) & (ventana["pct_debajo_sma3"] > 0.5)).any()
+
+    def sin_verde_dominante(i):
+        if i < 1:
+            return False
+        ventana = df.iloc[max(0, i-5):i]
+        return not ((ventana["es_alcista"]) & (ventana["pct_encima_sma3"] > 0.5)).any()
+
+    df["sin_roja_dominante"] = pd.Series([sin_roja_dominante(i) for i in range(len(df))], index=df.index)
+    df["sin_verde_dominante"] = pd.Series([sin_verde_dominante(i) for i in range(len(df))], index=df.index)
+
     df["COMPRAR"] = (
         df["tendencia_alcista"] & df["verde_encima_cian"] &
         df["lineas_separadas"] & df["es_alcista"] &
-        (df["pct_encima_sma3"] >= umbral) & df["mechas_ok"]
+        (df["pct_encima_sma3"] >= umbral) & df["mechas_ok"] &
+        df["pullback_call"] & df["sin_cruce_reciente"] & df["sin_roja_dominante"]
     )
     df["VENDER"] = (
         df["tendencia_bajista"] & df["verde_debajo_cian"] &
         df["lineas_separadas"] & df["es_bajista"] &
-        (df["pct_debajo_sma3"] >= umbral) & df["mechas_ok"]
+        (df["pct_debajo_sma3"] >= umbral) & df["mechas_ok"] &
+        df["pullback_put"] & df["sin_cruce_reciente"] & df["sin_verde_dominante"]
     )
 
     return df
@@ -165,6 +236,7 @@ class Telemetria:
     def __init__(self):
         self.operaciones = []
         self.sesion_inicio = datetime.now().isoformat()
+        self._lock = threading.Lock()
         self.cargar()
 
     def cargar(self):
@@ -177,32 +249,32 @@ class Telemetria:
                 self.operaciones = []
 
     def guardar(self):
-        """Guarda todo el historial a disco"""
-        with open(CONFIG["log_file"], "w") as f:
-            json.dump(self.operaciones, f, indent=2, default=str)
+        with self._lock:
+            with open(CONFIG["log_file"], "w") as f:
+                json.dump(self.operaciones, f, indent=2, default=str)
 
     def registrar(self, operacion: dict):
-        """Registra una operación completa"""
-        op = {
-            "id": len(self.operaciones) + 1,
-            "timestamp": datetime.now().isoformat(),
-            "activo": operacion.get("activo", ""),
-            "direccion": operacion.get("direccion", ""),
-            "monto": operacion.get("monto", 0),
-            "payout": operacion.get("payout", 0),
-            "resultado": operacion.get("resultado", ""),     # "win", "loss", "tie"
-            "ganancia": operacion.get("ganancia", 0),
-            "paso_martingala": operacion.get("paso", 1),
-            "balance_despues": operacion.get("balance", 0),
-            # Datos del análisis
-            "sma3": operacion.get("sma3", 0),
-            "sma50": operacion.get("sma50", 0),
-            "pct_cuerpo": operacion.get("pct_cuerpo", 0),
-            "ratio_mechas": operacion.get("ratio_mechas", 0),
-            "close": operacion.get("close", 0),
-        }
-        self.operaciones.append(op)
-        self.guardar()
+        with self._lock:
+            op = {
+                "id": len(self.operaciones) + 1,
+                "timestamp": datetime.now().isoformat(),
+                "activo": operacion.get("activo", ""),
+                "direccion": operacion.get("direccion", ""),
+                "monto": operacion.get("monto", 0),
+                "payout": operacion.get("payout", 0),
+                "resultado": operacion.get("resultado", ""),
+                "ganancia": operacion.get("ganancia", 0),
+                "paso_martingala": operacion.get("paso", 1),
+                "balance_despues": operacion.get("balance", 0),
+                "sma3": operacion.get("sma3", 0),
+                "sma50": operacion.get("sma50", 0),
+                "pct_cuerpo": operacion.get("pct_cuerpo", 0),
+                "ratio_mechas": operacion.get("ratio_mechas", 0),
+                "close": operacion.get("close", 0),
+            }
+            self.operaciones.append(op)
+            with open(CONFIG["log_file"], "w") as f:
+                json.dump(self.operaciones, f, indent=2, default=str)
         self.actualizar_estadisticas()
         return op
 
@@ -382,21 +454,21 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS operaciones (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ciclo_id         INTEGER REFERENCES ciclos(id),
                     timestamp        TEXT    NOT NULL,
-                    activo           TEXT    NOT NULL,
+                    hora             TEXT    NOT NULL,
+                    par              TEXT    NOT NULL,
                     direccion        TEXT,
-                    monto            REAL,
-                    payout           REAL,
-                    resultado        TEXT,   -- win / loss / tie
-                    ganancia         REAL,
-                    paso_martingala  INTEGER DEFAULT 1,
-                    balance_despues  REAL,
+                    tipo             TEXT,
+                    precio_apertura  REAL,
+                    resultado        TEXT,
+                    pasos_martingala INTEGER DEFAULT 1,
+                    monto_total      REAL,
+                    ganancia_neta    REAL,
+                    pasos_json       TEXT,
                     sma3             REAL,
                     sma50            REAL,
                     pct_cuerpo       REAL,
-                    ratio_mechas     REAL,
-                    close_price      REAL
+                    ratio_mechas     REAL
                 );
             """)
 
@@ -442,19 +514,30 @@ class Database:
 
     # ── Operaciones ───────────────────────────────
 
-    def registrar_operacion(self, ciclo_id: int, datos: dict):
+    def registrar_ciclo_completo(self, datos: dict):
+        """Inserta UNA fila por ciclo completo (all martingale steps aggregated)."""
         with self._lock, self._conn() as conn:
             conn.execute(
                 """INSERT INTO operaciones
-                   (ciclo_id, timestamp, activo, direccion, monto, payout, resultado,
-                    ganancia, paso_martingala, balance_despues, sma3, sma50,
-                    pct_cuerpo, ratio_mechas, close_price)
+                   (timestamp, hora, par, direccion, tipo, precio_apertura,
+                    resultado, pasos_martingala, monto_total, ganancia_neta,
+                    pasos_json, sma3, sma50, pct_cuerpo, ratio_mechas)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (ciclo_id, datetime.now().isoformat(),
-                 datos["activo"], datos["direccion"], datos["monto"], datos["payout"],
-                 datos["resultado"], datos["ganancia"], datos["paso"],
-                 datos["balance"], datos["sma3"], datos["sma50"],
-                 datos["pct_cuerpo"], datos["ratio_mechas"], datos["close"])
+                (datetime.now().isoformat(),
+                 datos["hora"],
+                 datos["par"],
+                 datos["direccion"],
+                 "alza" if datos["direccion"] == "call" else "baja",
+                 datos["precio_apertura"],
+                 datos["resultado"],
+                 datos["pasos_martingala"],
+                 round(datos["monto_total"], 2),
+                 round(datos["ganancia_neta"], 2),
+                 json.dumps(datos.get("pasos_json", [])),
+                 datos.get("sma3", 0),
+                 datos.get("sma50", 0),
+                 datos.get("pct_cuerpo", 0),
+                 datos.get("ratio_mechas", 0))
             )
 
     # ── Consultas para el dashboard ───────────────
@@ -473,7 +556,7 @@ class Database:
             losses = sum(1 for r in rows if r["resultado"]=="loss")
             ties   = sum(1 for r in rows if r["resultado"]=="tie")
             total  = len(rows)
-            gan    = sum(r.get("ganancia",0) or 0 for r in rows)
+            gan    = sum(r.get("ganancia_neta",0) or 0 for r in rows)
             wr     = round(wins/total*100, 1) if total else 0
 
             # racha actual
@@ -489,7 +572,7 @@ class Database:
             # martingala por paso
             por_paso = {}
             for r in rows:
-                p = str(r.get("paso_martingala", 1) or 1)
+                p = str(r.get("pasos_martingala", 1) or 1)
                 if p not in por_paso:
                     por_paso[p] = {"wins":0,"losses":0,"ties":0,"total":0}
                 por_paso[p]["total"] += 1
@@ -508,6 +591,69 @@ class Database:
         ops_hoy   = self.query("SELECT * FROM operaciones WHERE timestamp LIKE ? ORDER BY id DESC", (f"{hoy}%",))
         ops_todas = self.query("SELECT * FROM operaciones ORDER BY id DESC LIMIT 500")
         return {"hoy": agg(ops_hoy), "global": agg(ops_todas)}
+
+
+# Lock global que serializa TODOS los get_candles del proceso.
+# iqoptionapi usa un buffer de clase compartido — llamadas concurrentes
+# desde distintas instancias se contaminan entre sí. El lock garantiza
+# que solo un hilo a la vez envía y recibe velas por WebSocket.
+_candles_lock = threading.Lock()
+
+# ═══════════════════════════════════════════════
+# POOL DE CONEXIONES API
+# ═══════════════════════════════════════════════
+
+class ApiPool:
+    """
+    Pool de N conexiones IQ Option independientes.
+    Cada hilo de trading toma una conexión exclusiva del pool,
+    evitando completamente la contaminación del buffer WebSocket compartido.
+    """
+    def __init__(self, size: int, email: str, password: str, tipo_cuenta: str):
+        self._size       = size
+        self._email      = email
+        self._password   = password
+        self._tipo_cuenta = tipo_cuenta
+        self._pool: list = []          # conexiones disponibles
+        self._lock       = threading.Lock()
+        self._disponible = threading.Semaphore(0)  # se incrementa al conectar cada instancia
+
+    def conectar_todas(self) -> int:
+        """Conecta todas las instancias. Retorna cuántas quedaron activas."""
+        conectadas = 0
+        for i in range(self._size):
+            try:
+                print(f"   🔌 Pool API [{i+1}/{self._size}] conectando...")
+                api = IQ_Option(self._email, self._password)
+                ok, reason = api.connect()
+                if not ok and reason == "2FA":
+                    codigo = input("   Código 2FA: ").strip()
+                    ok, reason = api.connect_2fa(codigo)
+                if ok:
+                    api.change_balance(self._tipo_cuenta)
+                    with self._lock:
+                        self._pool.append(api)
+                    self._disponible.release()
+                    conectadas += 1
+                    print(f"   ✅ Pool API [{i+1}] lista")
+                else:
+                    print(f"   ⚠️ Pool API [{i+1}] falló: {reason}")
+            except Exception as e:
+                print(f"   ⚠️ Pool API [{i+1}] excepción: {e}")
+            time.sleep(1)  # pequeña pausa entre conexiones
+        return conectadas
+
+    def acquire(self) -> "IQ_Option":
+        """Bloquea hasta que haya una API disponible y la retorna."""
+        self._disponible.acquire()
+        with self._lock:
+            return self._pool.pop()
+
+    def release(self, api: "IQ_Option"):
+        """Devuelve una API al pool."""
+        with self._lock:
+            self._pool.append(api)
+        self._disponible.release()
 
 
 # ═══════════════════════════════════════════════
@@ -529,10 +675,26 @@ class GoldBot:
 
         # Paralelismo
         self._lock = threading.Lock()
-        self._candles_lock = threading.Lock()  # solo para fallback HTTP
-        self._candles_sem  = threading.Semaphore(5)  # máx 5 get_candles simultáneos
         self._trades_activos = set()
         self._stop_event = threading.Event()
+        self._pause_event = threading.Event()   # Ctrl+P: pausa búsqueda de nuevas señales
+        self._sem_paralelo = threading.Semaphore(10)  # máx 10 ciclos simultáneos
+
+        # Estado explícito por activo:
+        #   ausente / "libre"  → sin operación activa
+        #   "activo"           → paso 1 en curso
+        #   "martingala"       → paso 2+ en curso (martingala vigente)
+        # Mientras no sea "libre", el coordinador no puede abrir otra operación
+        # para ese activo bajo ninguna circunstancia.
+        self._estado_activos: dict[str, str] = {}
+
+        # Pool de conexiones API (una por hilo de trading, sin buffer compartido)
+        self._api_pool = ApiPool(
+            size        = 10,
+            email       = CONFIG["email"],
+            password    = CONFIG["password"],
+            tipo_cuenta = CONFIG["tipo_cuenta"],
+        )
 
         # Trades en vivo para visualización
         self._trades_vivos    = {}   # {activo: info_dict}
@@ -564,6 +726,11 @@ class GoldBot:
             balance = self.api.get_balance()
             print(f"✅ Conectado | Balance: ${balance:.2f} ({CONFIG['tipo_cuenta']})")
             self.conectado = True
+
+            # Conectar pool de APIs dedicadas para los hilos de trading
+            print("\n🔌 Inicializando pool de conexiones para operaciones paralelas...")
+            n = self._api_pool.conectar_todas()
+            print(f"   ✅ Pool listo: {n}/5 conexiones activas\n")
         else:
             print(f"❌ Error de conexión: {reason}")
             print(f"   Posibles causas:")
@@ -628,7 +795,7 @@ class GoldBot:
                 "califica": califica,
             })
 
-            if califica:
+            if califica and activo not in ACTIVOS_EXCLUIDOS:
                 activos_buenos.append({"nombre": activo, "payout": payout})
 
         activos_buenos.sort(key=lambda x: x["payout"], reverse=True)
@@ -665,7 +832,10 @@ class GoldBot:
     # ─────────────────────────────────────
 
     def obtener_velas(self, activo: str) -> pd.DataFrame:
-        with self._candles_sem:          # máx 5 hilos simultáneos
+        # Siempre descarga 200 velas completas — el fetch incremental de 3 velas
+        # era susceptible a contaminación del buffer WebSocket con precios de
+        # otros activos, causando entradas falsas y martingalas incorrectas.
+        with _candles_lock:
             velas = self.api.get_candles(
                 activo, CONFIG["timeframe"],
                 CONFIG["num_velas"], time.time()
@@ -735,39 +905,19 @@ class GoldBot:
             return float(raw[0]) if raw else 0.0
         return float(raw)
 
-    def _obtener_precio_actual(self, activo: str) -> float | None:
-        """Obtiene el precio del último tick disponible (candle de 1s para máxima precisión)."""
-        try:
-            # Timeframe 1s = precio más cercano al tick real
-            velas = self.api.get_candles(activo, 1, 3, time.time())
-            if velas:
-                return float(velas[-1].get("close", 0))
-        except Exception:
-            pass
-        try:
-            # Fallback: vela normal
-            velas = self.api.get_candles(activo, CONFIG["timeframe"], 2, time.time())
-            if velas:
-                return float(velas[-1].get("close", 0))
-        except Exception:
-            pass
-        return None
 
-    def _obtener_resultado_orden(self, _order_id, activo: str,
+    def _obtener_resultado_orden(self, order_id, activo: str,
                                  precio_entrada: float, direccion: str,
-                                 monto: float, payout: float) -> float:
+                                 monto: float, payout: float,
+                                 api: "IQ_Option" = None) -> float:
         """
-        Espera el vencimiento y obtiene el resultado.
-        Intenta leer buy_order_changed (precios exactos de IQ Option) por hasta 5s.
-        Si no llega, calcula con la vela cerrada como fallback.
+        Espera el vencimiento y obtiene el resultado REAL de IQ Option via
+        buy_order_changed[order_id]. Solo usa comparación de velas como fallback.
 
         Retorna: ganancia neta (positivo=WIN, 0=TIE, negativo=LOSS)
         """
         tf = CONFIG["timeframe"]
-        ahora = time.time()
-
-        segs_hasta_cierre = tf - (ahora % tf)
-        expira_en = segs_hasta_cierre + (CONFIG["expiracion"] - 1) * tf
+        expira_en = CONFIG["expiracion"] * tf  # 60s fijos desde colocación (tick-by-tick IQ Option)
 
         # — Countdown —
         t_inicio = time.time()
@@ -784,25 +934,48 @@ class GoldBot:
             time.sleep(0.5)
         print()
 
-        # — Vela cerrada al vencimiento —
-        time.sleep(0.5)
+        _api = api if api is not None else self.api
+
+        # — Resultado real de IQ Option (socket_option_closed por order_id) —
+        if order_id:
+            for intento in range(1, 181):  # hasta 90s (0.5s por iteración)
+                try:
+                    raw = _api.api.socket_option_closed.get(order_id)
+                    if raw is not None:
+                        msg     = raw.get("msg", {}) if isinstance(raw, dict) else {}
+                        win_str = str(msg.get("win", "")).lower()
+                        if win_str == "win":
+                            ganancia = round(float(msg.get("win_amount", 0)) - float(msg.get("sum", monto)), 4)
+                            print(f"   🏆 [{activo}] WIN +${ganancia:.4f}  (IQ: {win_str})")
+                            return ganancia
+                        elif win_str == "equal":
+                            print(f"   ⚖️  [{activo}] TIE — empate")
+                            return 0.0
+                        else:  # "loose"
+                            print(f"   ❌ [{activo}] LOSS  (IQ: {win_str})")
+                            return -monto
+                except Exception as e:
+                    print(f"   ⚠️ [{activo}] socket_option_closed intento {intento}: {e}")
+                time.sleep(0.5)
+            print(f"   ⚠️ [{activo}] Timeout esperando resultado IQ Option (30s) — usando velas como fallback")
+
+        # — Fallback: comparación de velas (si IQ Option no envió resultado) —
         ts_expira = t_inicio + expira_en
         precio_cierre = None
         for intento in range(1, 6):
             try:
-                velas = self.api.get_candles(activo, tf, 3, time.time())
+                with _candles_lock:
+                    velas = _api.get_candles(activo, tf, 3, time.time())
                 if velas:
                     for v in reversed(velas):
                         if v.get("from", 0) < ts_expira:
                             precio_cierre = float(v.get("close", 0))
-                            print(f"   🕯️  [{activo}] Vela cierre: "
-                                  f"open={v.get('open'):.5f} close={precio_cierre:.5f} "
-                                  f"(intento {intento})")
+                            print(f"   🕯️  [{activo}] fallback cierre={precio_cierre:.5f} (intento {intento})")
                             break
                 if precio_cierre:
                     break
             except Exception as e:
-                print(f"   ⚠️ [{activo}] Error obteniendo vela (intento {intento}): {e}")
+                print(f"   ⚠️ [{activo}] get_candles intento {intento}: {e}")
             time.sleep(1)
 
         if not precio_cierre:
@@ -811,7 +984,7 @@ class GoldBot:
 
         diferencia = precio_cierre - precio_entrada
         if abs(diferencia) < 0.0001:
-            print(f"   ⚠️  [{activo}] Diff={diferencia:+.5f} < 1pip — incierto → LOSS")
+            print(f"   ⚠️ [{activo}] diff={diferencia:+.5f} muy pequeño — LOSS")
             return -monto
 
         if (direccion == "call" and diferencia > 0) or (direccion == "put" and diferencia < 0):
@@ -831,7 +1004,7 @@ class GoldBot:
 
     def _ejecutar_paso(self, activo: str, direccion: str, monto: float,
                        payout: float, paso: int, ciclo_id: int,
-                       vela_data: dict) -> dict:
+                       vela_data: dict, api: "IQ_Option" = None) -> dict:
         """
         Coloca la orden con hasta MAX_REINTENTOS si es rechazada.
         Espera resultado inmediato. Registra en DB.
@@ -858,7 +1031,8 @@ class GoldBot:
         # — Colocar la orden (con reintentos si es rechazada) —
         order_id = None
         for intento_buy in range(1, MAX_REINTENTOS + 1):
-            status, order_raw = self.api.buy(monto, activo, direccion, CONFIG["expiracion"])
+            _api = api if api is not None else self.api
+            status, order_raw = _api.buy(monto, activo, direccion, CONFIG["expiracion"])
             if status:
                 order_id = self._extraer_order_id(order_raw)
                 print(f"   🛠️  [{activo}] buy() intento {intento_buy} → id={order_id!r}")
@@ -879,65 +1053,58 @@ class GoldBot:
                 self._trades_vivos.pop(activo, None)
             return {"ejecutada": False, "razon": "orden rechazada tras reintentos"}
 
-        # Precio de entrada = tick exacto de IQ Option (buy_order_changed llega en ~1-2s)
-        precio_entrada = None
-        precio_entrada = self._obtener_precio_actual(activo) or vela_data.get("close", 0)
+        # Precio de entrada: vela actual justo tras el buy() para que coincida
+        # con el precio real de IQ Option — especialmente importante en martingala
+        # donde la vela señal original puede tener minutos de antigüedad.
+        precio_entrada = float(vela_data.get("close", 0))  # fallback
+        try:
+            with _candles_lock:
+                velas_ahora = _api.get_candles(activo, CONFIG["timeframe"], 1, time.time())
+            if velas_ahora:
+                precio_entrada = float(velas_ahora[-1].get("close", 0))
+        except Exception:
+            pass  # si falla, usa el precio de la vela señal como fallback
         print(f"   ✅ [{activo}] Orden #{order_id} colocada | entrada: {precio_entrada:.5f}")
+
+        # Limpiar resultado anterior para este order_id (evita leer stale data)
+        try:
+            _api.api.socket_option_closed.pop(order_id, None)
+        except Exception:
+            pass
 
         # — Esperar y calcular resultado por precio —
         resultado_valor = self._obtener_resultado_orden(
-            order_id, activo, precio_entrada, direccion, monto, payout
+            order_id, activo, precio_entrada, direccion, monto, payout, api=api
         )
-
-        balance = self.api.get_balance()
 
         if resultado_valor > 0:
             resultado = "win"
-            print(f"   🏆 [{activo}] WIN +${resultado_valor:.4f} | Balance: ${balance:.2f}")
+            print(f"   🏆 [{activo}] WIN +${resultado_valor:.4f}")
         elif resultado_valor == 0:
             resultado = "tie"
-            print(f"   🟡 [{activo}] TIE (empate) | Balance: ${balance:.2f}")
+            print(f"   🟡 [{activo}] TIE (empate)")
         else:
             resultado = "loss"
-            print(f"   💔 [{activo}] LOSS -${abs(resultado_valor):.2f} | Balance: ${balance:.2f}")
+            print(f"   💔 [{activo}] LOSS -${abs(resultado_valor):.2f}")
 
-        # — Mover de vivos a recientes en dashboard —
+        # Actualizar contadores en memoria (instantáneo, sin I/O)
         with self._lock:
+            self.operaciones_hoy += 1
+            self.ganancia_hoy    += resultado_valor
+            if resultado == "loss":
+                self.perdidas_hoy += 1
+            # Mover de vivos a recientes en dashboard
             info = self._trades_vivos.pop(activo, {})
-            info.update({
-                "resultado": resultado,
-                "ganancia": resultado_valor,
-                "ts_fin": datetime.now().isoformat(),
-                "balance_despues": balance,
-            })
+            info.update({"resultado": resultado, "ganancia": resultado_valor,
+                         "ts_fin": datetime.now().isoformat()})
             self._trades_recientes.insert(0, info)
             self._trades_recientes[:] = self._trades_recientes[:20]
 
-        # — Guardar en DB y telemetría —
-        datos = {
-            "activo": activo, "direccion": direccion, "monto": monto,
-            "payout": payout, "resultado": resultado, "ganancia": resultado_valor,
-            "paso": paso, "balance": balance,
-            "sma3": vela_data.get("sma3", 0), "sma50": vela_data.get("sma50", 0),
-            "pct_cuerpo": vela_data.get("pct_cuerpo", 0),
-            "ratio_mechas": vela_data.get("ratio_mechas", 0),
-            "close": vela_data.get("close", 0),
-        }
-        with self._lock:
-            self.telemetria.registrar(datos)
-            self.operaciones_hoy += 1
-            self.ganancia_hoy += resultado_valor
-            if resultado == "loss":
-                self.perdidas_hoy += 1
-        try:
-            self.db.registrar_operacion(ciclo_id, datos)
-            print(f"   💾 [{activo}] DB guardado — {resultado.upper()} ${resultado_valor:+.2f}")
-        except Exception as e_db:
-            print(f"   ⚠️ [{activo}] Error DB: {e_db}")
-
         return {
-            "ejecutada": True, "resultado": resultado,
-            "ganancia": resultado_valor, "balance": balance,
+            "ejecutada":       True,
+            "resultado":       resultado,
+            "ganancia":        resultado_valor,
+            "precio_entrada":  precio_entrada,
         }
 
     # ─────────────────────────────────────
@@ -960,59 +1127,115 @@ class GoldBot:
             print(f"   ⚠️ [{activo}] Payout {payout}% insuficiente — ciclo cancelado")
             return
 
-        ciclo_id = self.db.iniciar_ciclo(activo, direccion, payout, CONFIG["monto_base"])
-        print(f"\n{'─'*55}")
-        print(f"   🎯 CICLO INICIADO [{activo}] {direccion.upper()} | payout: {payout}% | ciclo_id: {ciclo_id}")
-        print(f"{'─'*55}")
+        # Adquirir una conexión API exclusiva para este hilo
+        api = self._api_pool.acquire()
 
-        ganancia_neta = 0.0
-        monto_maximo  = CONFIG["monto_base"]
-        resultado_final = "loss"
-        paso_final = 1
+        try:
+            ciclo_id = self.db.iniciar_ciclo(activo, direccion, payout, CONFIG["monto_base"])
+            print(f"\n{'─'*55}")
+            print(f"   🎯 CICLO INICIADO [{activo}] {direccion.upper()} | payout: {payout}% | ciclo_id: {ciclo_id}")
+            print(f"{'─'*55}")
 
-        for paso in range(1, CONFIG["max_pasos"] + 1):
-            puede, razon = self.verificar_limites()
-            if not puede:
-                print(f"   🛡️ [{activo}] Límite alcanzado: {razon} — ciclo cancelado")
-                resultado_final = "cancelado"
-                break
+            ganancia_neta   = 0.0
+            monto_total     = 0.0
+            monto_maximo    = CONFIG["monto_base"]
+            resultado_final = "loss"
+            paso_final      = 1
+            precio_apertura = float(vela_data.get("close", 0))
+            hora_inicio     = datetime.now().strftime("%H:%M:%S")
+            pasos_detalle   = []
 
-            monto = round(CONFIG["monto_base"] * (CONFIG["multiplicador"] ** (paso - 1)), 2)
-            monto_maximo = max(monto_maximo, monto)
-            paso_final   = paso
+            for paso in range(1, CONFIG["max_pasos"] + 1):
+                puede, razon = self.verificar_limites()
+                if not puede:
+                    print(f"   🛡️ [{activo}] Límite alcanzado: {razon} — ciclo cancelado")
+                    resultado_final = "cancelado"
+                    break
 
-            if paso > 1:
-                print(f"\n   🔄 [{activo}] MARTINGALA PASO {paso}/{CONFIG['max_pasos']} → ${monto:.2f} — ejecutando inmediatamente")
+                monto = round(CONFIG["monto_base"] * (CONFIG["multiplicador"] ** (paso - 1)), 2)
+                monto_maximo  = max(monto_maximo, monto)
+                monto_total  += monto
+                paso_final    = paso
 
-            res = self._ejecutar_paso(
-                activo, direccion, monto, payout, paso, ciclo_id, vela_data
-            )
+                if paso > 1:
+                    # Marcar estado martingala antes de ejecutar el paso
+                    with self._lock:
+                        self._estado_activos[activo] = "martingala"
+                    print(f"\n   🔄 [{activo}] MARTINGALA PASO {paso}/{CONFIG['max_pasos']} → ${monto:.2f}")
 
-            if not res["ejecutada"]:
-                print(f"   ❌ [{activo}] Paso {paso} no ejecutado — ciclo terminado")
-                resultado_final = "error"
-                break
+                res = self._ejecutar_paso(
+                    activo, direccion, monto, payout, paso, ciclo_id, vela_data, api=api
+                )
 
-            ganancia_neta  += res["ganancia"]
-            resultado_final = res["resultado"]
+                if not res["ejecutada"]:
+                    print(f"   ❌ [{activo}] Paso {paso} no ejecutado — ciclo terminado")
+                    resultado_final = "error"
+                    break
 
-            print(f"   📈 [{activo}] Paso {paso} → {res['resultado'].upper()} | "
-                  f"Neto acumulado: ${ganancia_neta:+.2f}")
+                ganancia_neta  += res["ganancia"]
+                resultado_final = res["resultado"]
+                # Use actual fill price from paso 1 as the cycle's entry price
+                if paso == 1:
+                    precio_apertura = res.get("precio_entrada", precio_apertura)
+                pasos_detalle.append({
+                    "paso":      paso,
+                    "monto":     monto,
+                    "resultado": res["resultado"],
+                    "ganancia":  round(res["ganancia"], 2),
+                })
 
-            if res["resultado"] == "win":
-                print(f"\n   ✅ [{activo}] CICLO GANADO en paso {paso} | Neto: ${ganancia_neta:+.2f}")
-                break
+                print(f"   📈 [{activo}] Paso {paso} → {res['resultado'].upper()} | "
+                      f"Neto acumulado: ${ganancia_neta:+.2f}")
 
-            # LOSS o TIE: continuar martingala si está activa
-            if not CONFIG["martingala_activa"]:
-                print(f"   🔴 [{activo}] {res['resultado'].upper()} | Martingala OFF — ciclo terminado")
-                break
+                if res["resultado"] == "win":
+                    print(f"\n   ✅ [{activo}] CICLO GANADO en paso {paso} | Neto: ${ganancia_neta:+.2f}")
+                    break
 
-            if paso == CONFIG["max_pasos"]:
-                print(f"\n   💀 [{activo}] CICLO PERDIDO — {paso} pasos agotados | Neto: ${ganancia_neta:+.2f}")
+                # LOSS o TIE: continuar martingala si está activa
+                if not CONFIG["martingala_activa"]:
+                    print(f"   🔴 [{activo}] {res['resultado'].upper()} | Martingala OFF — ciclo terminado")
+                    break
 
-        self.db.cerrar_ciclo(ciclo_id, resultado_final, ganancia_neta, paso_final, monto_maximo)
-        print(f"   📁 [{activo}] Ciclo #{ciclo_id} cerrado — {resultado_final.upper()} | Neto: ${ganancia_neta:+.2f}")
+                # Si el bot está pausado (Ctrl+P), no continuar con más pasos de martingala
+                if self._pause_event.is_set():
+                    print(f"   ⏸️  [{activo}] PAUSADO — martingala detenida en paso {paso} | Neto: ${ganancia_neta:+.2f}")
+                    break
+
+                if paso == CONFIG["max_pasos"]:
+                    print(f"\n   💀 [{activo}] CICLO PERDIDO — {paso} pasos agotados | Neto: ${ganancia_neta:+.2f}")
+
+            # Balance solo al final del ciclo (evita roundtrip por cada paso)
+            try:
+                balance_final = api.get_balance()
+                print(f"   💰 [{activo}] Balance final: ${balance_final:.2f}")
+            except Exception as e_bal:
+                print(f"   ⚠️ [{activo}] No se pudo obtener balance: {e_bal}")
+            self.db.cerrar_ciclo(ciclo_id, resultado_final, ganancia_neta, paso_final, monto_maximo)
+
+            # Guardar ciclo completo en operaciones (una sola fila por ciclo)
+            try:
+                self.db.registrar_ciclo_completo({
+                    "hora":            hora_inicio,
+                    "par":             activo,
+                    "direccion":       direccion,
+                    "precio_apertura": precio_apertura,
+                    "resultado":       resultado_final,
+                    "pasos_martingala": paso_final,
+                    "monto_total":     monto_total,
+                    "ganancia_neta":   ganancia_neta,
+                    "pasos_json":      pasos_detalle,
+                    "sma3":            vela_data.get("sma3", 0),
+                    "sma50":           vela_data.get("sma50", 0),
+                    "pct_cuerpo":      vela_data.get("pct_cuerpo", 0),
+                    "ratio_mechas":    vela_data.get("ratio_mechas", 0),
+                })
+                print(f"   💾 [{activo}] Ciclo #{ciclo_id} guardado en DB — {resultado_final.upper()} | Neto: ${ganancia_neta:+.2f}")
+            except Exception as e_db:
+                print(f"   ⚠️ [{activo}] Error guardando en DB: {e_db}")
+
+        finally:
+            # Siempre devolver la API al pool, aunque ocurra una excepción
+            self._api_pool.release(api)
 
     # ─────────────────────────────────────
     # GESTIÓN DE RIESGO
@@ -1074,7 +1297,43 @@ class GoldBot:
             motivo.append(f"cuerpo {pct_d:.0%}<{umbral:.0%}")
         if not vela["mechas_ok"]:
             motivo.append(f"mechas {mecha:.0%}>{CONFIG['max_mecha_ratio']:.0%}")
+        if vela["tendencia_alcista"] and vela["es_alcista"] and not vela["pullback_call"]:
+            motivo.append("sin pullback (no hay roja en últimas 5)")
+        if vela["tendencia_bajista"] and vela["es_bajista"] and not vela["pullback_put"]:
+            motivo.append("sin pullback (no hay verde en últimas 5)")
+        if not vela["sin_cruce_reciente"]:
+            motivo.append("cruce SMA50 en últimas 15 velas")
+        if vela["tendencia_alcista"] and vela["es_alcista"] and not vela["sin_roja_dominante"]:
+            motivo.append("vela roja >50% bajo SMA3 en últimas 5")
+        if vela["tendencia_bajista"] and vela["es_bajista"] and not vela["sin_verde_dominante"]:
+            motivo.append("vela verde >50% sobre SMA3 en últimas 5")
         return " · ".join(motivo) if motivo else "condiciones mixtas"
+
+    def _escuchar_teclado(self):
+        """Hilo daemon — detecta Ctrl+P para pausar/reanudar búsqueda de señales."""
+        import msvcrt
+        while not self._stop_event.is_set():
+            try:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    # Ctrl+P = carácter \x10
+                    if ch == "\x10":
+                        if self._pause_event.is_set():
+                            self._pause_event.clear()
+                            print("\n\n  ▶️  BÚSQUEDA REANUDADA — buscando nuevas señales...\n")
+                        else:
+                            self._pause_event.set()
+                            with self._lock:
+                                activos_vivos = dict(self._estado_activos)
+                            if activos_vivos:
+                                nombres = ", ".join(activos_vivos.keys())
+                                print(f"\n\n  ⏸️  PAUSADO — no se abrirán nuevas operaciones")
+                                print(f"  ⌛ Esperando que finalicen: {nombres}\n")
+                            else:
+                                print(f"\n\n  ⏸️  PAUSADO — no hay operaciones activas\n")
+            except Exception:
+                pass
+            time.sleep(0.1)
 
     def _coordinador(self):
         """
@@ -1133,22 +1392,40 @@ class GoldBot:
             if self._stop_event.is_set():
                 break
 
+            # ── 3b. Verificar pausa (Ctrl+P) ──
+            if self._pause_event.is_set():
+                with self._lock:
+                    activos_vivos = dict(self._estado_activos)
+                if activos_vivos:
+                    nombres = ", ".join(activos_vivos.keys())
+                    print(f"\n  ⏸️  PAUSADO — esperando que finalicen: {nombres}")
+                else:
+                    print(f"\n  ⏸️  PAUSADO — sin operaciones activas. Ctrl+P para reanudar.")
+                # Esperar hasta que se reanude o se detenga
+                while self._pause_event.is_set() and not self._stop_event.is_set():
+                    time.sleep(0.5)
+                if self._stop_event.is_set():
+                    break
+                continue
+
             print(f"\n{'─'*62}")
             print(f"  👁️  ESCANEANDO SEÑALES  [{datetime.now().strftime('%H:%M:%S')}]  ({len(activos_scan)} activos)")
             print(f"{'─'*62}")
 
-            # ── 4. Evaluar señal en cada activo (mayor payout primero) ──
-            señal_encontrada = False
+            # ── 4. Evaluar señales (hasta 5 en paralelo) ──
+            señales_lanzadas = 0
             for activo_info in activos_scan:
                 activo = activo_info["nombre"]
                 if self._stop_event.is_set():
+                    break
+                if señales_lanzadas >= 2:
                     break
 
                 try:
                     df = self.obtener_velas(activo)
                     df = calcular_señales(df)
                     self._guardar_cache(activo, df)
-                    vela = df.iloc[-2]   # última vela cerrada
+                    vela = df.iloc[-2]
 
                     vela_data = {
                         "sma3":        round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
@@ -1159,29 +1436,50 @@ class GoldBot:
                     }
 
                     if vela["COMPRAR"]:
-                        print(f"\n  🟢 SEÑAL CALL → {activo} ({activo_info['payout']}%)")
-                        self._ciclo_trade(activo, "call", vela_data)
-                        señal_encontrada = True
-                        # Después del ciclo → rescanear payout
-                        ultimo_scan = 0
-                        break
-
+                        direccion = "call"
                     elif vela["VENDER"]:
-                        print(f"\n  🔴 SEÑAL PUT  → {activo} ({activo_info['payout']}%)")
-                        self._ciclo_trade(activo, "put", vela_data)
-                        señal_encontrada = True
-                        ultimo_scan = 0
-                        break
-
+                        direccion = "put"
                     else:
                         motivo = self._log_señal(activo, vela)
                         print(f"  ⬜ {activo:<26} sin señal  ({motivo})")
+                        continue
+
+                    # Atómico: verificar estado + adquirir slot + marcar "activo"
+                    with self._lock:
+                        estado = self._estado_activos.get(activo, "libre")
+                        if estado != "libre":
+                            print(f"  ⏭️  {activo:<26} estado={estado} — omitido")
+                            continue
+                        if not self._sem_paralelo.acquire(blocking=False):
+                            print(f"  ⏭️  Máximo de operaciones paralelas alcanzado ({self._max_paralelo})")
+                            break
+                        self._estado_activos[activo] = "activo"
+
+                    icono = "🟢" if direccion == "call" else "🔴"
+                    print(f"\n  {icono} SEÑAL {direccion.upper()} → {activo} | estado=activo ({activo_info['payout']}%)")
+                    print(f"  📋 Estados: { {k: v for k,v in self._estado_activos.items()} }")
+
+                    def _lanzar(act=activo, dir=direccion, vd=vela_data):
+                        try:
+                            self._ciclo_trade(act, dir, vd)
+                        finally:
+                            with self._lock:
+                                self._estado_activos.pop(act, None)
+                                print(f"  🗑️  [{act}] liberado | Estados: {dict(self._estado_activos)}")
+                            self._sem_paralelo.release()
+
+                    hilo = threading.Thread(target=_lanzar, daemon=True)
+                    hilo.start()
+                    señales_lanzadas += 1
+                    ultimo_scan = 0
 
                 except Exception as e:
                     print(f"  ⚠️ [{activo}] Error evaluando señal: {e}")
 
-            if not señal_encontrada:
+            if señales_lanzadas == 0:
                 print(f"\n  ⏸️  Sin señales esta vela — esperando próxima...")
+            else:
+                print(f"\n  🚀 {señales_lanzadas} operación(es) lanzadas en paralelo")
 
             # Mostrar estadísticas de sesión
             stats = self.telemetria.stats_hoy()
@@ -1189,6 +1487,7 @@ class GoldBot:
                 print(f"  📊 Sesión: {stats['wins']}W / {stats['losses']}L  |  "
                       f"WR: {stats['winrate']:.0f}%  |  "
                       f"P/L: ${stats['ganancia_total']:+.2f}")
+                self._mostrar_tabla_ciclos()
 
         print(f"\n{'═'*62}")
         print(f"  🛑 Coordinador detenido")
@@ -1207,6 +1506,20 @@ class GoldBot:
             print("❌ Ejecuta conectar() primero")
             return
 
+        # ── Preguntar número de operaciones simultáneas ──
+        while True:
+            try:
+                resp = input("\n  ¿Cuántas operaciones simultáneas? (1-10): ").strip()
+                n = int(resp)
+                if 1 <= n <= 10:
+                    break
+                print("  ⚠️  Ingresa un número entre 1 y 10.")
+            except ValueError:
+                print("  ⚠️  Número inválido.")
+        self._max_paralelo = n
+        self._sem_paralelo = threading.Semaphore(n)
+        # El pool se conectó con 10 slots; el semáforo limita cuántos usamos
+
         print("\n" + "═" * 62)
         print("  🚀 GOLD 4.0 v3 — Bot Activo")
         print(f"  💵 Monto base    : ${CONFIG['monto_base']}")
@@ -1215,13 +1528,52 @@ class GoldBot:
         print(f"  🎯 Payout mínimo : {CONFIG['payout_minimo']}%")
         print(f"  ⏰ Rescaneo cada : {CONFIG['rescan_intervalo']} min")
         print(f"  📋 Cuenta        : {CONFIG['tipo_cuenta']}")
+        print(f"  🔀 Simultáneas   : {n}")
+        print(f"  ⏸️  Pausar búsqueda: Ctrl+P  (las operaciones activas finalizan solas)")
         print("═" * 62)
+
+        # Hilo daemon para capturar Ctrl+P
+        hilo_kb = threading.Thread(target=self._escuchar_teclado, daemon=True)
+        hilo_kb.start()
 
         try:
             self._coordinador()
         except KeyboardInterrupt:
             print("\n\n🛑 Bot detenido")
             self.mostrar_resumen_final()
+
+    def _mostrar_tabla_ciclos(self):
+        """Imprime tabla de ciclos completados hoy — una fila por ciclo."""
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        filas = self.db.query(
+            """SELECT id, activo, direccion, timestamp_inicio, pasos_usados,
+                      monto_inicial, monto_maximo, ganancia_neta, resultado_final
+               FROM ciclos
+               WHERE resultado_final IS NOT NULL
+                 AND resultado_final != 'cancelado'
+                 AND timestamp_inicio LIKE ?
+               ORDER BY id""",
+            (f"{hoy}%",)
+        )
+        if not filas:
+            return
+
+        print(f"\n  {'─'*80}")
+        print(f"  {'#':>4}  {'Hora':>8}  {'Activo':<22}  {'Dir':>4}  {'Pasos':>5}  {'Monto$':>7}  {'Neto$':>7}  {'Res':>4}")
+        print(f"  {'─'*80}")
+        for f in filas:
+            hora  = (f.get("timestamp_inicio") or "")[:19][11:19]  # HH:MM:SS
+            dir_s = (f.get("direccion") or "").upper()[:4]
+            res   = f.get("resultado_final", "")
+            icono = "✅" if res == "win" else ("💀" if res == "loss" else "──")
+            neto  = f.get("ganancia_neta") or 0
+            print(
+                f"  {f['id']:>4}  {hora:>8}  {f['activo']:<22}  {dir_s:>4}  "
+                f"{f.get('pasos_usados',1):>5}  "
+                f"{f.get('monto_maximo',0):>7.2f}  "
+                f"{neto:>+7.2f}  {icono}"
+            )
+        print(f"  {'─'*80}")
 
     def mostrar_resumen_final(self):
         """Muestra resumen al detener el bot"""
@@ -1360,24 +1712,23 @@ def iniciar_servidor_dashboard(db: Database = None, bot=None):
 
             elif path == "/api/db/activos" and db:
                 rows = db.query("""
-                    SELECT activo,
+                    SELECT par AS activo,
                            COUNT(*)                                          AS total_ops,
                            SUM(CASE WHEN resultado='win'  THEN 1 ELSE 0 END) AS wins,
                            SUM(CASE WHEN resultado='loss' THEN 1 ELSE 0 END) AS losses,
                            SUM(CASE WHEN resultado='tie'  THEN 1 ELSE 0 END) AS ties,
-                           ROUND(AVG(payout), 1)                             AS payout_promedio,
-                           ROUND(SUM(ganancia), 2)                           AS ganancia_total,
+                           ROUND(SUM(ganancia_neta), 2)                      AS ganancia_total,
                            ROUND(AVG(CASE WHEN resultado='win' THEN 1.0 ELSE 0.0 END)*100, 1) AS winrate,
-                           MAX(timestamp)                                    AS ultima_op
+                           MAX(timestamp)                                     AS ultima_op
                     FROM operaciones
-                    GROUP BY activo
+                    GROUP BY par
                     ORDER BY ganancia_total DESC
                 """)
                 json_resp(self, rows)
 
             elif path == "/api/db/resumen" and db:
                 ops = db.query("""
-                    SELECT resultado, COUNT(*) as n, ROUND(SUM(ganancia),2) as ganancia
+                    SELECT resultado, COUNT(*) as n, ROUND(SUM(ganancia_neta),2) as ganancia
                     FROM operaciones GROUP BY resultado
                 """)
                 ciclos = db.query("""
@@ -1418,18 +1769,11 @@ def iniciar_servidor_dashboard(db: Database = None, bot=None):
                     if cached:
                         json_resp(self, cached[-n:])
                     else:
-                        # caché vacío → fetch usando el semáforo compartido
+                        # caché vacío → fetch con API principal (solo display)
                         try:
-                            got = bot._candles_sem.acquire(timeout=15)
-                            if not got:
-                                json_resp(self, [])
-                                return
-                            try:
-                                raw = bot.api.get_candles(
-                                    activo, CONFIG["timeframe"], n, time.time()
-                                )
-                            finally:
-                                bot._candles_sem.release()
+                            raw = bot.api.get_candles(
+                                activo, CONFIG["timeframe"], n, time.time()
+                            )
                             if raw:
                                 velas = sorted([{
                                     "time":  int(v["from"]),
