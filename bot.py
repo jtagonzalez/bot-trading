@@ -468,6 +468,20 @@ class Database:
                     run_id           INTEGER REFERENCES runs(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS ciclos_flotantes (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id           INTEGER REFERENCES runs(id),
+                    timestamp_inicio TEXT NOT NULL,
+                    timestamp_fin    TEXT,
+                    pasos_usados     INTEGER DEFAULT 1,
+                    resultado_final  TEXT,
+                    ganancia_neta    REAL DEFAULT 0,
+                    monto_inicial    REAL,
+                    monto_maximo     REAL,
+                    pasos_json       TEXT,
+                    activos_json     TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS runs (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp_inicio TEXT NOT NULL,
@@ -523,6 +537,24 @@ class Database:
                  datos.get("payout"),
                  1 if datos.get("gano_p1") else 0,
                  1 if datos.get("gano_p2") else 0)
+            )
+
+    def registrar_ciclo_flotante(self, datos: dict):
+        """Guarda un ciclo de martingala flotante (multi-activo) en su tabla propia."""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO ciclos_flotantes
+                   (run_id, timestamp_inicio, timestamp_fin, pasos_usados,
+                    resultado_final, ganancia_neta, monto_inicial, monto_maximo,
+                    pasos_json, activos_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (datos.get("run_id"), datos.get("timestamp_inicio"),
+                 datetime.now().isoformat(),
+                 datos.get("pasos_usados"), datos.get("resultado_final"),
+                 round(datos.get("ganancia_neta", 0), 2),
+                 datos.get("monto_inicial"), datos.get("monto_maximo"),
+                 json.dumps(datos.get("pasos_json", [])),
+                 json.dumps(datos.get("activos_json", [])))
             )
 
     # ── Runs ──────────────────────────────────────
@@ -756,16 +788,16 @@ class GoldBot:
         self._lock = threading.Lock()
         self._trades_activos = set()
         self._stop_event = threading.Event()
-        self._pause_event = threading.Event()   # Ctrl+P: pausa búsqueda de nuevas señales
-        self._sem_paralelo = threading.Semaphore(10)  # máx 10 ciclos simultáneos
+        self._pause_event = threading.Event()
+        self._sem_paralelo = threading.Semaphore(10)
 
-        # Estado explícito por activo:
-        #   ausente / "libre"  → sin operación activa
-        #   "activo"           → paso 1 en curso
-        #   "martingala"       → paso 2+ en curso (martingala vigente)
-        # Mientras no sea "libre", el coordinador no puede abrir otra operación
-        # para ese activo bajo ninguna circunstancia.
         self._estado_activos: dict[str, str] = {}
+
+        # Martingala flotante: estado global del ciclo en curso entre activos
+        # None = sin ciclo activo
+        # Cuando step 1 pierde, _ciclo_trade escribe aquí y el coordinador
+        # busca señal en activo diferente para el siguiente paso.
+        self._mart: dict = None
 
         # Pool de conexiones API (una por hilo de trading, sin buffer compartido)
         self._api_pool = ApiPool(
@@ -1197,157 +1229,123 @@ class GoldBot:
 
     def _ciclo_trade(self, activo: str, direccion: str, vela_data: dict, ruta_captura: str = ""):
         """
-        Ejecuta el ciclo completo de trading con martingala.
-        Flujo:
-          paso 1 → resultado?
-            WIN  → termina ciclo
-            LOSS → martingala paso 2 (espera nueva vela) → resultado?
-              WIN  → termina ciclo
-              LOSS → martingala paso 3 ...
-              (hasta max_pasos)
+        Ejecuta SOLO el paso 1 de un ciclo flotante.
+        - WIN  → cierra el ciclo inmediatamente
+        - LOSS → activa self._mart para que el coordinador busque
+                 el paso 2 en un activo diferente la siguiente vela
         """
         payout = self.obtener_payout_actual(activo)
         if payout < CONFIG["payout_minimo"]:
             print(f"   ⚠️ [{activo}] Payout {payout}% insuficiente — ciclo cancelado")
             return
 
-        # Adquirir una conexión API exclusiva para este hilo
         api = self._api_pool.acquire()
-
         try:
-            ciclo_id = self.db.iniciar_ciclo(activo, direccion, payout, CONFIG["monto_base"],
+            monto = CONFIG["monto_base"]
+            ciclo_id = self.db.iniciar_ciclo(activo, direccion, payout, monto,
                                               run_id=self._run_id)
+            hora_inicio = datetime.now().strftime("%H:%M:%S")
+            ts_inicio   = datetime.now().isoformat()
+            precio_apertura = float(vela_data.get("close", 0))
+
             print(f"\n{'─'*55}")
-            print(f"   🎯 CICLO INICIADO [{activo}] {direccion.upper()} | payout: {payout}% | ciclo_id: {ciclo_id}")
+            print(f"   🎯 CICLO FLOTANTE P1 [{activo}] {direccion.upper()} | ${monto:.2f} | payout:{payout}%")
             print(f"{'─'*55}")
 
-            ganancia_neta   = 0.0
-            monto_total     = 0.0
-            monto_maximo    = CONFIG["monto_base"]
-            resultado_final = "loss"
-            paso_final      = 1
-            precio_apertura = float(vela_data.get("close", 0))
-            hora_inicio     = datetime.now().strftime("%H:%M:%S")
-            pasos_detalle   = []
+            res = self._ejecutar_paso(activo, direccion, monto, payout, 1, ciclo_id, vela_data, api=api)
 
-            for paso in range(1, CONFIG["max_pasos"] + 1):
-                puede, razon = self.verificar_limites()
-                if not puede:
-                    print(f"   🛡️ [{activo}] Límite alcanzado: {razon} — ciclo cancelado")
-                    resultado_final = "cancelado"
-                    break
+            if not res["ejecutada"]:
+                self.db.cerrar_ciclo(ciclo_id, "error", 0, 1, monto)
+                return
 
-                monto = round(CONFIG["monto_base"] * (CONFIG["multiplicador"] ** (paso - 1)), 2)
-                monto_maximo  = max(monto_maximo, monto)
-                monto_total  += monto
-                paso_final    = paso
+            precio_apertura = res.get("precio_entrada", precio_apertura)
+            paso_detalle = {"paso": 1, "activo": activo, "direccion": direccion,
+                            "monto": monto, "resultado": res["resultado"],
+                            "ganancia": round(res["ganancia"], 2)}
 
-                if paso > 1:
-                    # Marcar estado martingala antes de ejecutar el paso
-                    with self._lock:
-                        self._estado_activos[activo] = "martingala"
-                    print(f"\n   🔄 [{activo}] MARTINGALA PASO {paso}/{CONFIG['max_pasos']} → ${monto:.2f}")
-
-                res = self._ejecutar_paso(
-                    activo, direccion, monto, payout, paso, ciclo_id, vela_data, api=api
+            if res["resultado"] == "win":
+                ganancia_neta = res["ganancia"]
+                self.db.cerrar_ciclo(ciclo_id, "win", ganancia_neta, 1, monto)
+                self._renombrar_captura(ruta_captura, "win")
+                self._guardar_ciclo_flotante_db(
+                    ciclo_id, ts_inicio, 1, "win", ganancia_neta,
+                    monto, monto, [paso_detalle], [activo]
                 )
-
-                if not res["ejecutada"]:
-                    print(f"   ❌ [{activo}] Paso {paso} no ejecutado — ciclo terminado")
-                    resultado_final = "error"
-                    break
-
-                ganancia_neta  += res["ganancia"]
-                resultado_final = res["resultado"]
-                # Use actual fill price from paso 1 as the cycle's entry price
-                if paso == 1:
-                    precio_apertura = res.get("precio_entrada", precio_apertura)
-                pasos_detalle.append({
-                    "paso":      paso,
-                    "monto":     monto,
-                    "resultado": res["resultado"],
-                    "ganancia":  round(res["ganancia"], 2),
-                })
-
-                print(f"   📈 [{activo}] Paso {paso} → {res['resultado'].upper()} | "
-                      f"Neto acumulado: ${ganancia_neta:+.2f}")
-
-                if res["resultado"] == "win":
-                    print(f"\n   ✅ [{activo}] CICLO GANADO en paso {paso} | Neto: ${ganancia_neta:+.2f}")
-                    break
-
-                # LOSS o TIE: continuar martingala si está activa
-                if not CONFIG["martingala_activa"]:
-                    print(f"   🔴 [{activo}] {res['resultado'].upper()} | Martingala OFF — ciclo terminado")
-                    break
-
-                # Si el bot está pausado (Ctrl+P), no continuar con más pasos de martingala
-                if self._pause_event.is_set():
-                    print(f"   ⏸️  [{activo}] PAUSADO — martingala detenida en paso {paso} | Neto: ${ganancia_neta:+.2f}")
-                    break
-
-                if paso == CONFIG["max_pasos"]:
-                    print(f"\n   💀 [{activo}] CICLO PERDIDO — {paso} pasos agotados | Neto: ${ganancia_neta:+.2f}")
-
-            # Balance solo al final del ciclo (evita roundtrip por cada paso)
-            try:
-                balance_final = api.get_balance()
-                print(f"   💰 [{activo}] Balance final: ${balance_final:.2f}")
-            except Exception as e_bal:
-                print(f"   ⚠️ [{activo}] No se pudo obtener balance: {e_bal}")
-            self.db.cerrar_ciclo(ciclo_id, resultado_final, ganancia_neta, paso_final, monto_maximo)
-            self._renombrar_captura(ruta_captura, resultado_final)
-
-            # Guardar datos de la señal en tabla indicadores (estrategia 2 pasos)
-            try:
-                gano_p1 = len(pasos_detalle) >= 1 and pasos_detalle[0]["resultado"] == "win"
-                gano_p2 = len(pasos_detalle) >= 2 and pasos_detalle[1]["resultado"] == "win"
-                self.db.registrar_indicadores({
-                    "ciclo_id":       ciclo_id,
-                    "run_id":         self._run_id,
-                    "activo":         activo,
-                    "direccion":      direccion,
-                    "resultado_final":resultado_final,
-                    "pasos_usados":   paso_final,
-                    "ganancia_neta":  ganancia_neta,
-                    "sma3":           vela_data.get("sma3"),
-                    "sma50":          vela_data.get("sma50"),
-                    "distancia_smas": vela_data.get("distancia_smas"),
-                    "pct_cuerpo":     vela_data.get("pct_cuerpo"),
-                    "ratio_mechas":   vela_data.get("ratio_mechas"),
-                    "precio_entrada": precio_apertura,
-                    "payout":         payout,
-                    "gano_p1":        gano_p1,
-                    "gano_p2":        gano_p2,
-                })
-            except Exception as e_ind:
-                print(f"   ⚠️ [{activo}] Error guardando indicadores: {e_ind}")
-
-            # Guardar ciclo completo en operaciones (una sola fila por ciclo)
-            try:
-                self.db.registrar_ciclo_completo({
-                    "hora":            hora_inicio,
-                    "par":             activo,
-                    "direccion":       direccion,
-                    "precio_apertura": precio_apertura,
-                    "resultado":       resultado_final,
-                    "pasos_martingala": paso_final,
-                    "monto_total":     monto_total,
-                    "ganancia_neta":   ganancia_neta,
-                    "pasos_json":      pasos_detalle,
-                    "sma3":            vela_data.get("sma3", 0),
-                    "sma50":           vela_data.get("sma50", 0),
-                    "pct_cuerpo":      vela_data.get("pct_cuerpo", 0),
-                    "ratio_mechas":    vela_data.get("ratio_mechas", 0),
-                    "run_id":          self._run_id,
-                })
-                print(f"   💾 [{activo}] Ciclo #{ciclo_id} guardado en DB — {resultado_final.upper()} | Neto: ${ganancia_neta:+.2f}")
-            except Exception as e_db:
-                print(f"   ⚠️ [{activo}] Error guardando en DB: {e_db}")
-
+                print(f"   ✅ [{activo}] P1 WIN | Neto: ${ganancia_neta:+.2f}")
+                try:
+                    bal = api.get_balance()
+                    print(f"   💰 Balance: ${bal:.2f}")
+                except Exception:
+                    pass
+            else:
+                # LOSS en paso 1 → activar martingala flotante
+                ganancia_neta = res["ganancia"]
+                self._renombrar_captura(ruta_captura, "loss_p1")
+                print(f"   🔄 [{activo}] P1 LOSS — activando martingala flotante paso 2")
+                with self._lock:
+                    self._mart = {
+                        "ciclo_id":       ciclo_id,
+                        "ts_inicio":      ts_inicio,
+                        "hora_inicio":    hora_inicio,
+                        "paso":           2,
+                        "monto":          round(monto * CONFIG["multiplicador"], 2),
+                        "monto_inicial":  monto,
+                        "monto_maximo":   monto,
+                        "ganancia_neta":  ganancia_neta,
+                        "activos_usados": {activo},
+                        "pasos_detalle":  [paso_detalle],
+                        "vela_data_p1":   vela_data,
+                        "precio_apertura":precio_apertura,
+                    }
         finally:
-            # Siempre devolver la API al pool, aunque ocurra una excepción
             self._api_pool.release(api)
+
+    def _ejecutar_paso_flotante(self, activo: str, direccion: str,
+                                 vela_data: dict, payout: float) -> dict:
+        """
+        Ejecuta un paso de martingala flotante (paso 2-4) con una conexión del pool.
+        Retorna el resultado del paso.
+        """
+        mart = self._mart
+        paso  = mart["paso"]
+        monto = mart["monto"]
+
+        print(f"\n   🔄 MARTINGALA FLOTANTE P{paso} [{activo}] {direccion.upper()} | ${monto:.2f} | payout:{payout}%")
+
+        api = self._api_pool.acquire()
+        try:
+            res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
+                                      mart["ciclo_id"], vela_data, api=api)
+            try:
+                bal = api.get_balance()
+                print(f"   💰 Balance: ${bal:.2f}")
+            except Exception:
+                pass
+            return res
+        finally:
+            self._api_pool.release(api)
+
+    def _guardar_ciclo_flotante_db(self, ciclo_id: int, ts_inicio: str,
+                                    paso_final: int, resultado: str,
+                                    ganancia_neta: float, monto_inicial: float,
+                                    monto_maximo: float, pasos_detalle: list,
+                                    activos: list):
+        """Persiste el ciclo flotante completo en ciclos_flotantes y operaciones."""
+        try:
+            self.db.registrar_ciclo_flotante({
+                "run_id":          self._run_id,
+                "timestamp_inicio":ts_inicio,
+                "pasos_usados":    paso_final,
+                "resultado_final": resultado,
+                "ganancia_neta":   ganancia_neta,
+                "monto_inicial":   monto_inicial,
+                "monto_maximo":    monto_maximo,
+                "pasos_json":      pasos_detalle,
+                "activos_json":    activos,
+            })
+            print(f"   💾 Ciclo flotante #{ciclo_id} → {resultado.upper()} | Neto:{ganancia_neta:+.2f} | Activos:{activos}")
+        except Exception as e:
+            print(f"   ⚠️ Error guardando ciclo flotante: {e}")
 
     # ─────────────────────────────────────
     # GESTIÓN DE RIESGO
@@ -1628,80 +1626,186 @@ class GoldBot:
             print(f"  👁️  ESCANEANDO SEÑALES  [{datetime.now().strftime('%H:%M:%S')}]  ({len(activos_scan)} activos)")
             print(f"{'─'*62}")
 
-            # ── 4. Evaluar señales (hasta 5 en paralelo) ──
-            señales_lanzadas = 0
-            for activo_info in activos_scan:
-                activo = activo_info["nombre"]
-                if self._stop_event.is_set():
-                    break
-                if señales_lanzadas >= 2:
-                    break
+            with self._lock:
+                mart_activo = self._mart is not None
 
-                try:
-                    df = self.obtener_velas(activo)
-                    df = calcular_señales(df)
-                    self._guardar_cache(activo, df)
-                    vela = df.iloc[-2]
+            # ── 4a. Martingala flotante activa → buscar señal en activo diferente ──
+            if mart_activo:
+                with self._lock:
+                    mart = dict(self._mart)
+                    activos_usados = set(mart["activos_usados"])
 
-                    vela_data = {
-                        "sma3":          round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
-                        "sma50":         round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
-                        "distancia_smas":round(float(vela["distancia_smas"]), 6) if not pd.isna(vela["distancia_smas"]) else 0,
-                        "pct_cuerpo":    round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
-                        "ratio_mechas":  round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
-                        "close":         round(float(vela["close"]), 5),
-                    }
+                paso  = mart["paso"]
+                monto = mart["monto"]
+                print(f"  🔄 MARTINGALA FLOTANTE P{paso} — buscando señal (excluidos: {activos_usados})")
 
-                    if vela["COMPRAR"]:
-                        direccion = "call"
-                    elif vela["VENDER"]:
-                        direccion = "put"
-                    else:
-                        motivo = self._log_señal(activo, vela)
-                        print(f"  ⬜ {activo:<26} sin señal  ({motivo})")
+                paso_ejecutado = False
+                for activo_info in activos_scan:
+                    activo = activo_info["nombre"]
+                    if activo in activos_usados:
                         continue
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        df = self.obtener_velas(activo)
+                        df = calcular_señales(df)
+                        self._guardar_cache(activo, df)
+                        vela = df.iloc[-2]
 
-                    # Atómico: verificar estado + adquirir slot + marcar "activo"
-                    with self._lock:
-                        estado = self._estado_activos.get(activo, "libre")
-                        if estado != "libre":
-                            print(f"  ⏭️  {activo:<26} estado={estado} — omitido")
+                        if vela["COMPRAR"]:
+                            direccion = "call"
+                        elif vela["VENDER"]:
+                            direccion = "put"
+                        else:
                             continue
-                        if not self._sem_paralelo.acquire(blocking=False):
-                            print(f"  ⏭️  Máximo de operaciones paralelas alcanzado ({self._max_paralelo})")
-                            break
-                        self._estado_activos[activo] = "activo"
 
-                    icono = "🟢" if direccion == "call" else "🔴"
-                    print(f"\n  {icono} SEÑAL {direccion.upper()} → {activo} | estado=activo ({activo_info['payout']}%)")
-                    print(f"  📋 Estados: { {k: v for k,v in self._estado_activos.items()} }")
+                        vela_data = {
+                            "sma3":          round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
+                            "sma50":         round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
+                            "distancia_smas":round(float(vela["distancia_smas"]), 6) if not pd.isna(vela["distancia_smas"]) else 0,
+                            "pct_cuerpo":    round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
+                            "ratio_mechas":  round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
+                            "close":         round(float(vela["close"]), 5),
+                        }
 
-                    # Captura antes de entrar — bloqueante (necesitamos la ruta antes del ciclo)
-                    ruta_captura = self._generar_captura(
-                        df, activo, direccion, activo_info["payout"], CONFIG["monto_base"]
-                    )
+                        payout = self.obtener_payout_actual(activo)
+                        if payout < CONFIG["payout_minimo"]:
+                            continue
 
-                    def _lanzar(act=activo, dir=direccion, vd=vela_data, ruta=ruta_captura):
-                        try:
-                            self._ciclo_trade(act, dir, vd, ruta_captura=ruta)
-                        finally:
-                            with self._lock:
-                                self._estado_activos.pop(act, None)
-                                print(f"  🗑️  [{act}] liberado | Estados: {dict(self._estado_activos)}")
-                            self._sem_paralelo.release()
+                        icono = "🟢" if direccion == "call" else "🔴"
+                        print(f"\n  {icono} MART P{paso} → {activo} {direccion.upper()} ${monto:.2f} payout:{payout}%")
 
-                    hilo = threading.Thread(target=_lanzar, daemon=True)
-                    hilo.start()
-                    señales_lanzadas += 1
-                    ultimo_scan = 0
+                        res = self._ejecutar_paso_flotante(activo, direccion, vela_data, payout)
+                        paso_ejecutado = True
 
-                except Exception as e:
-                    print(f"  ⚠️ [{activo}] Error evaluando señal: {e}")
+                        paso_det = {"paso": paso, "activo": activo, "direccion": direccion,
+                                    "monto": monto, "resultado": res.get("resultado","error"),
+                                    "ganancia": round(res.get("ganancia", 0), 2)}
 
-            if señales_lanzadas == 0:
-                print(f"\n  ⏸️  Sin señales esta vela — esperando próxima...")
+                        with self._lock:
+                            if res.get("resultado") == "win":
+                                self._mart["ganancia_neta"] += res["ganancia"]
+                                self._mart["pasos_detalle"].append(paso_det)
+                                self._mart["monto_maximo"] = max(self._mart["monto_maximo"], monto)
+                                mart_snap = dict(self._mart)
+                                self._mart = None
+                            else:
+                                self._mart["ganancia_neta"] += res.get("ganancia", 0)
+                                self._mart["pasos_detalle"].append(paso_det)
+                                self._mart["monto_maximo"] = max(self._mart["monto_maximo"], monto)
+                                self._mart["activos_usados"].add(activo)
+                                if paso >= CONFIG["max_pasos"]:
+                                    mart_snap = dict(self._mart)
+                                    self._mart = None
+                                else:
+                                    self._mart["paso"]  += 1
+                                    self._mart["monto"]  = round(monto * CONFIG["multiplicador"], 2)
+                                    mart_snap = None
+
+                        if res.get("resultado") == "win":
+                            g = mart_snap["ganancia_neta"]
+                            self.db.cerrar_ciclo(mart_snap["ciclo_id"], "win", g,
+                                                 paso, mart_snap["monto_maximo"])
+                            activos_lista = [p["activo"] for p in mart_snap["pasos_detalle"]]
+                            self._guardar_ciclo_flotante_db(
+                                mart_snap["ciclo_id"], mart_snap["ts_inicio"],
+                                paso, "win", g,
+                                mart_snap["monto_inicial"], mart_snap["monto_maximo"],
+                                mart_snap["pasos_detalle"], activos_lista)
+                            print(f"\n  ✅ CICLO FLOTANTE GANADO en P{paso} | Neto: ${g:+.2f}")
+                        elif mart_snap is not None:
+                            g = mart_snap["ganancia_neta"]
+                            self.db.cerrar_ciclo(mart_snap["ciclo_id"], "loss", g,
+                                                 paso, mart_snap["monto_maximo"])
+                            activos_lista = [p["activo"] for p in mart_snap["pasos_detalle"]]
+                            self._guardar_ciclo_flotante_db(
+                                mart_snap["ciclo_id"], mart_snap["ts_inicio"],
+                                paso, "loss", g,
+                                mart_snap["monto_inicial"], mart_snap["monto_maximo"],
+                                mart_snap["pasos_detalle"], activos_lista)
+                            print(f"\n  💀 CICLO FLOTANTE PERDIDO — {paso} pasos agotados | Neto: ${g:+.2f}")
+                        else:
+                            print(f"  🔄 P{paso} LOSS — esperando siguiente vela para P{paso+1}")
+
+                        ultimo_scan = 0
+                        break
+                    except Exception as e:
+                        print(f"  ⚠️ [{activo}] Error en mart flotante: {e}")
+
+                if not paso_ejecutado:
+                    print(f"  ⏳ Sin señal para martingala P{paso} esta vela — esperando próxima...")
+
+            # ── 4b. Sin martingala activa → buscar señal nueva (paso 1) ──
             else:
-                print(f"\n  🚀 {señales_lanzadas} operación(es) lanzadas en paralelo")
+                señales_lanzadas = 0
+                for activo_info in activos_scan:
+                    activo = activo_info["nombre"]
+                    if self._stop_event.is_set():
+                        break
+                    if señales_lanzadas >= 2:
+                        break
+
+                    try:
+                        df = self.obtener_velas(activo)
+                        df = calcular_señales(df)
+                        self._guardar_cache(activo, df)
+                        vela = df.iloc[-2]
+
+                        vela_data = {
+                            "sma3":          round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
+                            "sma50":         round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
+                            "distancia_smas":round(float(vela["distancia_smas"]), 6) if not pd.isna(vela["distancia_smas"]) else 0,
+                            "pct_cuerpo":    round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
+                            "ratio_mechas":  round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
+                            "close":         round(float(vela["close"]), 5),
+                        }
+
+                        if vela["COMPRAR"]:
+                            direccion = "call"
+                        elif vela["VENDER"]:
+                            direccion = "put"
+                        else:
+                            motivo = self._log_señal(activo, vela)
+                            print(f"  ⬜ {activo:<26} sin señal  ({motivo})")
+                            continue
+
+                        with self._lock:
+                            estado = self._estado_activos.get(activo, "libre")
+                            if estado != "libre":
+                                print(f"  ⏭️  {activo:<26} estado={estado} — omitido")
+                                continue
+                            if not self._sem_paralelo.acquire(blocking=False):
+                                print(f"  ⏭️  Máximo de operaciones paralelas alcanzado ({self._max_paralelo})")
+                                break
+                            self._estado_activos[activo] = "activo"
+
+                        icono = "🟢" if direccion == "call" else "🔴"
+                        print(f"\n  {icono} SEÑAL {direccion.upper()} → {activo} ({activo_info['payout']}%)")
+
+                        ruta_captura = self._generar_captura(
+                            df, activo, direccion, activo_info["payout"], CONFIG["monto_base"]
+                        )
+
+                        def _lanzar(act=activo, dir=direccion, vd=vela_data, ruta=ruta_captura):
+                            try:
+                                self._ciclo_trade(act, dir, vd, ruta_captura=ruta)
+                            finally:
+                                with self._lock:
+                                    self._estado_activos.pop(act, None)
+                                self._sem_paralelo.release()
+
+                        hilo = threading.Thread(target=_lanzar, daemon=True)
+                        hilo.start()
+                        señales_lanzadas += 1
+                        ultimo_scan = 0
+
+                    except Exception as e:
+                        print(f"  ⚠️ [{activo}] Error evaluando señal: {e}")
+
+                if señales_lanzadas == 0:
+                    print(f"\n  ⏸️  Sin señales esta vela — esperando próxima...")
+                else:
+                    print(f"\n  🚀 {señales_lanzadas} operación(es) lanzadas")
 
             # Mostrar estadísticas de sesión
             stats = self.telemetria.stats_hoy()
