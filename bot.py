@@ -76,15 +76,15 @@ CONFIG = {
     # --- Martingala ---
     "martingala_activa": True,
     "multiplicador": 2.4,             # Multiplicador tras pérdida
-    "max_pasos": 6,                   # Máx entradas seguidas (1 original + 5 martingala)
+    "max_pasos": 4,                   # Máx entradas: 1 original + 3 martingala
 
     # --- Indicadores ---
     "sma_rapida": 3,
     "sma_tendencia": 50,
 
     # --- Filtros de la estrategia ---
-    "porcentaje_cuerpo": 0.60,          # % mínimo del cuerpo sobre/bajo SMA3 (0.95 era demasiado estricto)
-    "max_mecha_ratio": 2.0,             # mechas máx como múltiplo del cuerpo (2.0 = mechas < 200% cuerpo)
+    "porcentaje_cuerpo": 0.60,          # % mínimo del cuerpo sobre/bajo SMA3
+    "max_mecha_ratio": 1.0,             # mechas máx como múltiplo del cuerpo
     "velas_inclinacion": 3,
     "separacion_minima": 0.0000,
 
@@ -104,14 +104,9 @@ CONFIG = {
     "payout_minimo": 80,              # % mínimo para mantener observador activo
 }
 
-# Activos excluidos permanentemente (2+ pérdidas completas de 6 pasos)
-ACTIVOS_EXCLUIDOS = {
-    "SNDK-OTC",
-    "SANDUSD-OTC",
-    "IMXUSD-OTC",
-    "EURUSD-OTC",
-    "CHFNOK-OTC",
-}
+# Sin exclusiones — corrida limpia para comparar con run anterior (run_id=0)
+# Los resultados quedan separados por run_id en la DB
+ACTIVOS_EXCLUIDOS: set = set()
 
 
 # ═══════════════════════════════════════════════
@@ -449,7 +444,8 @@ class Database:
                     ganancia_neta    REAL    DEFAULT 0,
                     monto_inicial    REAL,
                     monto_maximo     REAL,
-                    payout_inicial   REAL
+                    payout_inicial   REAL,
+                    run_id           INTEGER REFERENCES runs(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS operaciones (
@@ -468,9 +464,89 @@ class Database:
                     sma3             REAL,
                     sma50            REAL,
                     pct_cuerpo       REAL,
-                    ratio_mechas     REAL
+                    ratio_mechas     REAL,
+                    run_id           INTEGER REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS runs (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_inicio TEXT NOT NULL,
+                    monto_base       REAL,
+                    multiplicador    REAL,
+                    max_pasos        INTEGER,
+                    max_mecha_ratio  REAL,
+                    pct_cuerpo_min   REAL,
+                    payout_minimo    REAL,
+                    activos_excluidos TEXT,
+                    notas            TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS indicadores (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ciclo_id         INTEGER REFERENCES ciclos(id),
+                    run_id           INTEGER REFERENCES runs(id),
+                    timestamp        TEXT NOT NULL,
+                    activo           TEXT NOT NULL,
+                    direccion        TEXT,
+                    resultado_final  TEXT,
+                    pasos_usados     INTEGER,
+                    ganancia_neta    REAL,
+                    sma3             REAL,
+                    sma50            REAL,
+                    distancia_smas   REAL,
+                    pct_cuerpo       REAL,
+                    ratio_mechas     REAL,
+                    precio_entrada   REAL,
+                    payout           REAL,
+                    gano_p1          INTEGER,
+                    gano_p2          INTEGER
                 );
             """)
+
+    # ── Indicadores ───────────────────────────────
+
+    def registrar_indicadores(self, datos: dict):
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO indicadores
+                   (ciclo_id, run_id, timestamp, activo, direccion,
+                    resultado_final, pasos_usados, ganancia_neta,
+                    sma3, sma50, distancia_smas,
+                    pct_cuerpo, ratio_mechas, precio_entrada,
+                    payout, gano_p1, gano_p2)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datos.get("ciclo_id"), datos.get("run_id"), datetime.now().isoformat(),
+                 datos["activo"], datos["direccion"],
+                 datos.get("resultado_final"), datos.get("pasos_usados"), datos.get("ganancia_neta"),
+                 datos.get("sma3"), datos.get("sma50"), datos.get("distancia_smas"),
+                 datos.get("pct_cuerpo"), datos.get("ratio_mechas"), datos.get("precio_entrada"),
+                 datos.get("payout"),
+                 1 if datos.get("gano_p1") else 0,
+                 1 if datos.get("gano_p2") else 0)
+            )
+
+    # ── Runs ──────────────────────────────────────
+
+    def iniciar_run(self, notas: str = "") -> int:
+        """Registra una nueva corrida del bot con su configuración. Retorna run_id."""
+        with self._lock, self._conn() as conn:
+            # Marcar datos sin run_id como run 0 (histórico pre-runs)
+            conn.execute("UPDATE ciclos SET run_id=0 WHERE run_id IS NULL")
+            conn.execute("UPDATE operaciones SET run_id=0 WHERE run_id IS NULL")
+            cur = conn.execute(
+                """INSERT INTO runs
+                   (timestamp_inicio, monto_base, multiplicador, max_pasos,
+                    max_mecha_ratio, pct_cuerpo_min, payout_minimo,
+                    activos_excluidos, notas)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(),
+                 CONFIG["monto_base"], CONFIG["multiplicador"], CONFIG["max_pasos"],
+                 CONFIG["max_mecha_ratio"], CONFIG["porcentaje_cuerpo"],
+                 CONFIG["payout_minimo"],
+                 json.dumps(sorted(ACTIVOS_EXCLUIDOS)),
+                 notas)
+            )
+            return cur.lastrowid
 
     # ── Escaneos ──────────────────────────────────
 
@@ -493,12 +569,14 @@ class Database:
 
     # ── Ciclos ────────────────────────────────────
 
-    def iniciar_ciclo(self, activo: str, direccion: str, payout: float, monto: float) -> int:
+    def iniciar_ciclo(self, activo: str, direccion: str, payout: float, monto: float,
+                      run_id: int = 0) -> int:
         with self._lock, self._conn() as conn:
             cur = conn.execute(
-                """INSERT INTO ciclos (activo, direccion, timestamp_inicio, payout_inicial, monto_inicial, monto_maximo)
-                   VALUES (?,?,?,?,?,?)""",
-                (activo, direccion, datetime.now().isoformat(), payout, monto, monto)
+                """INSERT INTO ciclos (activo, direccion, timestamp_inicio, payout_inicial,
+                   monto_inicial, monto_maximo, run_id)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (activo, direccion, datetime.now().isoformat(), payout, monto, monto, run_id)
             )
             return cur.lastrowid
 
@@ -521,8 +599,8 @@ class Database:
                 """INSERT INTO operaciones
                    (timestamp, hora, par, direccion, tipo, precio_apertura,
                     resultado, pasos_martingala, monto_total, ganancia_neta,
-                    pasos_json, sma3, sma50, pct_cuerpo, ratio_mechas)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    pasos_json, sma3, sma50, pct_cuerpo, ratio_mechas, run_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (datetime.now().isoformat(),
                  datos["hora"],
                  datos["par"],
@@ -537,7 +615,8 @@ class Database:
                  datos.get("sma3", 0),
                  datos.get("sma50", 0),
                  datos.get("pct_cuerpo", 0),
-                 datos.get("ratio_mechas", 0))
+                 datos.get("ratio_mechas", 0),
+                 datos.get("run_id", 0))
             )
 
     # ── Consultas para el dashboard ───────────────
@@ -696,6 +775,10 @@ class GoldBot:
             tipo_cuenta = CONFIG["tipo_cuenta"],
         )
 
+        # Contadores de capturas por dirección (reinician al arrancar el bot)
+        self._captura_call = 0
+        self._captura_put  = 0
+
         # Trades en vivo para visualización
         self._trades_vivos    = {}   # {activo: info_dict}
         self._trades_recientes = []  # últimos 10 cerrados
@@ -726,6 +809,7 @@ class GoldBot:
             balance = self.api.get_balance()
             print(f"✅ Conectado | Balance: ${balance:.2f} ({CONFIG['tipo_cuenta']})")
             self.conectado = True
+            self._run_id = self.db.iniciar_run()
 
             # Conectar pool de APIs dedicadas para los hilos de trading
             print("\n🔌 Inicializando pool de conexiones para operaciones paralelas...")
@@ -1111,7 +1195,7 @@ class GoldBot:
     # CICLO COMPLETO: TRADE + MARTINGALA
     # ─────────────────────────────────────
 
-    def _ciclo_trade(self, activo: str, direccion: str, vela_data: dict):
+    def _ciclo_trade(self, activo: str, direccion: str, vela_data: dict, ruta_captura: str = ""):
         """
         Ejecuta el ciclo completo de trading con martingala.
         Flujo:
@@ -1131,7 +1215,8 @@ class GoldBot:
         api = self._api_pool.acquire()
 
         try:
-            ciclo_id = self.db.iniciar_ciclo(activo, direccion, payout, CONFIG["monto_base"])
+            ciclo_id = self.db.iniciar_ciclo(activo, direccion, payout, CONFIG["monto_base"],
+                                              run_id=self._run_id)
             print(f"\n{'─'*55}")
             print(f"   🎯 CICLO INICIADO [{activo}] {direccion.upper()} | payout: {payout}% | ciclo_id: {ciclo_id}")
             print(f"{'─'*55}")
@@ -1211,6 +1296,32 @@ class GoldBot:
             except Exception as e_bal:
                 print(f"   ⚠️ [{activo}] No se pudo obtener balance: {e_bal}")
             self.db.cerrar_ciclo(ciclo_id, resultado_final, ganancia_neta, paso_final, monto_maximo)
+            self._renombrar_captura(ruta_captura, resultado_final)
+
+            # Guardar datos de la señal en tabla indicadores (estrategia 2 pasos)
+            try:
+                gano_p1 = len(pasos_detalle) >= 1 and pasos_detalle[0]["resultado"] == "win"
+                gano_p2 = len(pasos_detalle) >= 2 and pasos_detalle[1]["resultado"] == "win"
+                self.db.registrar_indicadores({
+                    "ciclo_id":       ciclo_id,
+                    "run_id":         self._run_id,
+                    "activo":         activo,
+                    "direccion":      direccion,
+                    "resultado_final":resultado_final,
+                    "pasos_usados":   paso_final,
+                    "ganancia_neta":  ganancia_neta,
+                    "sma3":           vela_data.get("sma3"),
+                    "sma50":          vela_data.get("sma50"),
+                    "distancia_smas": vela_data.get("distancia_smas"),
+                    "pct_cuerpo":     vela_data.get("pct_cuerpo"),
+                    "ratio_mechas":   vela_data.get("ratio_mechas"),
+                    "precio_entrada": precio_apertura,
+                    "payout":         payout,
+                    "gano_p1":        gano_p1,
+                    "gano_p2":        gano_p2,
+                })
+            except Exception as e_ind:
+                print(f"   ⚠️ [{activo}] Error guardando indicadores: {e_ind}")
 
             # Guardar ciclo completo en operaciones (una sola fila por ciclo)
             try:
@@ -1228,6 +1339,7 @@ class GoldBot:
                     "sma50":           vela_data.get("sma50", 0),
                     "pct_cuerpo":      vela_data.get("pct_cuerpo", 0),
                     "ratio_mechas":    vela_data.get("ratio_mechas", 0),
+                    "run_id":          self._run_id,
                 })
                 print(f"   💾 [{activo}] Ciclo #{ciclo_id} guardado en DB — {resultado_final.upper()} | Neto: ${ganancia_neta:+.2f}")
             except Exception as e_db:
@@ -1309,15 +1421,119 @@ class GoldBot:
             motivo.append("vela verde >50% sobre SMA3 en últimas 5")
         return " · ".join(motivo) if motivo else "condiciones mixtas"
 
+    def _generar_captura(self, df: "pd.DataFrame", activo: str, direccion: str,
+                          payout: float, monto: float) -> str:
+        """Genera PNG antes de entrar. Retorna la ruta para renombrar al cerrar el ciclo."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import mplfinance as mpf
+            import matplotlib.patches as mpatches
+            import os
+
+            carpeta = f"capturas_2p/{direccion.upper()}"
+            os.makedirs(carpeta, exist_ok=True)
+
+            vista = df.iloc[-11:-1].copy()
+            vista.index = pd.to_datetime(vista.index)
+
+            ohlc = vista[["open", "high", "low", "close"]].copy()
+            ohlc.columns = ["Open", "High", "Low", "Close"]
+            ohlc["Volume"] = 0
+
+            sma3_s  = vista["sma_rapida"]
+            sma50_s = vista["sma_tendencia"]
+
+            ap = [
+                mpf.make_addplot(sma3_s,  color="#00e676", width=1.6, label="SMA 3"),
+                mpf.make_addplot(sma50_s, color="#29b6f6", width=2.0, label="SMA 50"),
+            ]
+
+            mc = mpf.make_marketcolors(
+                up="#26a69a", down="#ef5350", edge="inherit",
+                wick={"up": "#26a69a", "down": "#ef5350"}, volume="in"
+            )
+            style = mpf.make_mpf_style(
+                base_mpf_style="nightclouds", marketcolors=mc,
+                gridstyle=":", gridcolor="#2a2a2a",
+                facecolor="#0d0d0d", figcolor="#0d0d0d", edgecolor="#333333",
+                rc={"font.size": 9, "text.color": "#cccccc",
+                    "axes.labelcolor": "#cccccc",
+                    "xtick.color": "#888888", "ytick.color": "#888888"}
+            )
+
+            icono_dir = "PUT" if direccion == "put" else "CALL"
+            titulo = f"{icono_dir} — {activo}   |   Payout: {payout:.0f}%   |   Monto: ${monto:.2f}"
+
+            fig, axes = mpf.plot(
+                ohlc, type="candle", style=style, addplot=ap,
+                title=f"\n{titulo}", ylabel="Precio",
+                figsize=(13, 6), returnfig=True, warn_too_much_data=9999,
+            )
+
+            ax = axes[0]
+            ax.title.set_color("#ff7043" if direccion == "put" else "#00e676")
+            ax.title.set_fontsize(12)
+            ax.title.set_fontweight("bold")
+
+            patches = [
+                mpatches.Patch(color="#00e676", label=f"SMA 3  {float(sma3_s.iloc[-1]):.4f}"),
+                mpatches.Patch(color="#29b6f6", label=f"SMA 50  {float(sma50_s.iloc[-1]):.4f}"),
+            ]
+            ax.legend(handles=patches, loc="upper left", facecolor="#1a1a1a",
+                      edgecolor="#444", labelcolor="#cccccc", fontsize=9)
+
+            vela_señal = df.iloc[-2]
+            cuerpo = float(vela_señal.get("cuerpo", 0))
+            mechas = float(vela_señal.get("suma_mechas", 0))
+            ratio_m = mechas / cuerpo if cuerpo > 0 else 0
+            info = (f"Mechas/Cuerpo: {ratio_m:.0%}   Dirección: {direccion.upper()}")
+            fig.text(0.98, 0.03, info, ha="right", va="bottom", fontsize=8,
+                     color="#aaaaaa",
+                     bbox=dict(facecolor="#1a1a1a", edgecolor="#444", alpha=0.8))
+
+            with self._lock:
+                if direccion == "call":
+                    self._captura_call += 1
+                    n_seq = self._captura_call
+                else:
+                    self._captura_put += 1
+                    n_seq = self._captura_put
+
+            ruta = os.path.join(carpeta,
+                                f"{direccion.upper()}_{n_seq:04d}_{activo.replace('/', '_')}.png")
+            fig.savefig(ruta, dpi=120, bbox_inches="tight", facecolor="#0d0d0d")
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+            print(f"  📸 [{activo}] Captura guardada: {ruta}")
+            return ruta
+
+        except Exception as e:
+            print(f"  ⚠️ [{activo}] Error generando captura: {e}")
+            return ""
+
+    def _renombrar_captura(self, ruta: str, resultado: str):
+        """Agrega _WIN o _LOSS al nombre del archivo al cerrar el ciclo."""
+        if not ruta:
+            return
+        try:
+            import os
+            sufijo = "_WIN" if resultado == "win" else "_LOSS"
+            base, ext = os.path.splitext(ruta)
+            nueva = f"{base}{sufijo}{ext}"
+            os.rename(ruta, nueva)
+        except Exception as e:
+            print(f"  ⚠️ Error renombrando captura: {e}")
+
     def _escuchar_teclado(self):
-        """Hilo daemon — detecta Ctrl+P para pausar/reanudar búsqueda de señales."""
+        """Hilo daemon — detecta Ctrl+Q para pausar/reanudar búsqueda de señales."""
         import msvcrt
         while not self._stop_event.is_set():
             try:
                 if msvcrt.kbhit():
                     ch = msvcrt.getwch()
-                    # Ctrl+P = carácter \x10
-                    if ch == "\x10":
+                    # Ctrl+Q = carácter \x11
+                    if ch == "\x11":
                         if self._pause_event.is_set():
                             self._pause_event.clear()
                             print("\n\n  ▶️  BÚSQUEDA REANUDADA — buscando nuevas señales...\n")
@@ -1428,11 +1644,12 @@ class GoldBot:
                     vela = df.iloc[-2]
 
                     vela_data = {
-                        "sma3":        round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
-                        "sma50":       round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
-                        "pct_cuerpo":  round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
-                        "ratio_mechas":round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
-                        "close":       round(float(vela["close"]), 5),
+                        "sma3":          round(float(vela["sma_rapida"]),    5) if not pd.isna(vela["sma_rapida"])    else 0,
+                        "sma50":         round(float(vela["sma_tendencia"]), 5) if not pd.isna(vela["sma_tendencia"]) else 0,
+                        "distancia_smas":round(float(vela["distancia_smas"]), 6) if not pd.isna(vela["distancia_smas"]) else 0,
+                        "pct_cuerpo":    round(float(max(vela["pct_encima_sma3"], vela["pct_debajo_sma3"])), 3),
+                        "ratio_mechas":  round(float(vela["suma_mechas"] / vela["cuerpo"]), 3) if vela["cuerpo"] > 0 else 0,
+                        "close":         round(float(vela["close"]), 5),
                     }
 
                     if vela["COMPRAR"]:
@@ -1459,9 +1676,14 @@ class GoldBot:
                     print(f"\n  {icono} SEÑAL {direccion.upper()} → {activo} | estado=activo ({activo_info['payout']}%)")
                     print(f"  📋 Estados: { {k: v for k,v in self._estado_activos.items()} }")
 
-                    def _lanzar(act=activo, dir=direccion, vd=vela_data):
+                    # Captura antes de entrar — bloqueante (necesitamos la ruta antes del ciclo)
+                    ruta_captura = self._generar_captura(
+                        df, activo, direccion, activo_info["payout"], CONFIG["monto_base"]
+                    )
+
+                    def _lanzar(act=activo, dir=direccion, vd=vela_data, ruta=ruta_captura):
                         try:
-                            self._ciclo_trade(act, dir, vd)
+                            self._ciclo_trade(act, dir, vd, ruta_captura=ruta)
                         finally:
                             with self._lock:
                                 self._estado_activos.pop(act, None)
@@ -1529,7 +1751,7 @@ class GoldBot:
         print(f"  ⏰ Rescaneo cada : {CONFIG['rescan_intervalo']} min")
         print(f"  📋 Cuenta        : {CONFIG['tipo_cuenta']}")
         print(f"  🔀 Simultáneas   : {n}")
-        print(f"  ⏸️  Pausar búsqueda: Ctrl+P  (las operaciones activas finalizan solas)")
+        print(f"  ⏸️  Pausar búsqueda: Ctrl+Q  (las operaciones activas finalizan solas)")
         print("═" * 62)
 
         # Hilo daemon para capturar Ctrl+P
