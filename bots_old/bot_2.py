@@ -1,3 +1,5 @@
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║          ESTRATEGIA GOLD 4.0 v3 — Bot Completo IQ Option        ║
@@ -84,7 +86,7 @@ CONFIG = {
 
     # --- Filtros de la estrategia ---
     "porcentaje_cuerpo": 0.60,          # % mínimo del cuerpo sobre/bajo SMA3
-    "max_mecha_ratio": 0.5,          # mechas máx como múltiplo del cuerpo
+    "max_mecha_ratio": 1.0,             # mechas máx como múltiplo del cuerpo
     "velas_inclinacion": 3,
     "separacion_minima": 0.0000,
     # Pullback: al menos 1 vela contraria en las últimas 5 con cuerpo >= cuerpo de la vela señal
@@ -421,7 +423,7 @@ class Database:
         self._init()
 
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")  # permite lecturas concurrentes
         return conn
@@ -575,7 +577,7 @@ class Database:
             )
 
     def registrar_ciclo_6pasos(self, datos: dict):
-        """Guarda un ciclo completo de la estrategia 6 pasos (mismo activo) en ciclos_6pasos y horas_24."""
+        """Guarda ciclo en ciclos_6pasos y en run_16 (tabla aislada de esta estrategia)."""
         ts_fin = datetime.now().isoformat()
         params = (datos.get("run_id"), datos["activo"], datos["direccion"],
                   datos.get("timestamp_inicio"), ts_fin,
@@ -586,7 +588,7 @@ class Database:
                   datos.get("sma3"), datos.get("sma50"), datos.get("distancia_smas"),
                   datos.get("pct_cuerpo"), datos.get("ratio_mechas"),
                   json.dumps(datos.get("pasos_json", [])))
-        sql = """({tabla})
+        sql = """INSERT INTO {tabla}
                    (run_id, activo, direccion, timestamp_inicio, timestamp_fin,
                     pasos_usados, resultado_final, ganancia_neta,
                     monto_inicial, monto_maximo, payout_inicial,
@@ -594,11 +596,8 @@ class Database:
                     pasos_json)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
         with self._lock, self._conn() as conn:
-            conn.execute(sql.format(tabla="INSERT INTO ciclos_6pasos"), params)
-            try:
-                conn.execute(sql.format(tabla="INSERT INTO horas_24"), params)
-            except Exception:
-                pass
+            conn.execute(sql.format(tabla="ciclos_6pasos"), params)
+            conn.execute(sql.format(tabla="run_16"), params)
 
     def registrar_ciclo_flotante(self, datos: dict):
         """Guarda un ciclo de martingala flotante (multi-activo) en su tabla propia."""
@@ -850,6 +849,8 @@ class GoldBot:
         self._trades_activos = set()
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        self._red_ok = threading.Event()   # set = conexión activa, clear = sin red
+        self._red_ok.set()
         self._sem_paralelo = threading.Semaphore(10)
 
         self._estado_activos: dict[str, str] = {}
@@ -1314,14 +1315,31 @@ class GoldBot:
             for paso in range(1, CONFIG["max_pasos"] + 1):
                 if paso > 1:
                     print(f"\n   🔄 [{activo}] MARTINGALA P{paso} | ${monto:.2f}")
-
-                res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
-                                          ciclo_id, vela_data, api=api)
-
-                if not res["ejecutada"]:
-                    self.db.cerrar_ciclo(ciclo_id, "error", ganancia_neta, paso, monto_maximo)
-                    self._renombrar_captura(ruta_captura, "loss")
-                    return
+                    # Intentar martingala durante máximo 2 minutos
+                    t_limite = time.time() + 120
+                    res = None
+                    while time.time() < t_limite:
+                        res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
+                                                  ciclo_id, vela_data, api=api)
+                        if res["ejecutada"]:
+                            break
+                        restante = int(t_limite - time.time())
+                        if restante <= 0:
+                            break
+                        print(f"   ⏳ [{activo}] P{paso} reintentando martingala ({restante}s restantes)...")
+                        time.sleep(5)
+                    if res is None or not res["ejecutada"]:
+                        print(f"   ⏱️  [{activo}] P{paso} tiempo agotado (2min) — ciclo finalizado")
+                        self.db.cerrar_ciclo(ciclo_id, "cancelado", ganancia_neta, paso - 1, monto_maximo)
+                        self._renombrar_captura(ruta_captura, "loss")
+                        return
+                else:
+                    res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
+                                              ciclo_id, vela_data, api=api)
+                    if not res["ejecutada"]:
+                        self.db.cerrar_ciclo(ciclo_id, "error", ganancia_neta, paso, monto_maximo)
+                        self._renombrar_captura(ruta_captura, "loss")
+                        return
 
                 if paso == 1:
                     precio_apertura = res.get("precio_entrada", precio_apertura)
@@ -1649,6 +1667,13 @@ class GoldBot:
             if self._stop_event.is_set() or stop_event.is_set():
                 break
 
+            # ── Esperar reconexión si la red cayó ──
+            if not self._red_ok.is_set():
+                print(f"   ⏸️  [{activo}] Sin red — esperando reconexión...")
+                self._red_ok.wait()
+                if self._stop_event.is_set() or stop_event.is_set():
+                    break
+
             # ── Pausa (Ctrl+Espacio) ──
             if self._pause_event.is_set():
                 while self._pause_event.is_set() and not self._stop_event.is_set():
@@ -1744,13 +1769,77 @@ class GoldBot:
         while not self._stop_event.is_set():
             ahora = time.time()
 
+            # ── Watchdog de conexión ──
+            try:
+                conectado = self.api.check_connect()
+            except Exception:
+                conectado = False
+            if not conectado:
+                self._red_ok.clear()  # pausar todos los hilos
+                print(f"  ⚠️  [{datetime.now().strftime('%H:%M:%S')}] Conexión perdida — reconectando...")
+                reconectado = False
+                for intento in range(1, 6):
+                    if self._stop_event.is_set(): break
+                    try:
+                        ok, _ = self.api.connect()
+                        if ok:
+                            reconectado = True
+                            print(f"  ✅ Reconectado (intento {intento}) — forzando rescan...")
+                            ultimo_scan = 0
+                            break
+                    except Exception:
+                        pass
+                    print(f"  🔄 Intento {intento}/5 fallido — esperando 15s...")
+                    for _ in range(15):
+                        if self._stop_event.is_set(): break
+                        time.sleep(1)
+                if not reconectado:
+                    print(f"  ⏸️  [{datetime.now().strftime('%H:%M:%S')}] Sin conexión — modo espera hasta recuperar red...")
+                    espera = 0
+                    while not self._stop_event.is_set():
+                        time.sleep(30)
+                        espera += 30
+                        try:
+                            ok, _ = self.api.connect()
+                            if ok:
+                                reconectado = True
+                                print(f"  ✅ [{datetime.now().strftime('%H:%M:%S')}] Conexión restaurada tras {espera//60}m {espera%60}s — reanudando...")
+                                ultimo_scan = 0
+                                break
+                        except Exception:
+                            pass
+                        if espera % 300 == 0:
+                            print(f"  ⏸️  [{datetime.now().strftime('%H:%M:%S')}] Aún sin conexión ({espera//60}m esperando)...")
+                if reconectado:
+                    self._red_ok.set()  # reanudar todos los hilos
+                else:
+                    continue
+
             # ── Rescanear payout y ajustar hilos ──
             if ahora - ultimo_scan >= CONFIG["rescan_intervalo"] * 60:
                 print(f"\n{'═'*62}")
                 print(f"  🔍 ESCANEO DE PAYOUT  [{datetime.now().strftime('%H:%M:%S')}]")
                 print(f"{'═'*62}")
 
-                activos_scan = self.obtener_activos_rentables()
+                activos_scan = None
+                _resultado   = []
+                def _hacer_scan():
+                    try:
+                        _resultado.append(self.obtener_activos_rentables())
+                    except Exception:
+                        _resultado.append([])
+                _t = threading.Thread(target=_hacer_scan, daemon=True)
+                _t.start()
+                _t.join(timeout=60)  # 60 segundos máximo
+                if _t.is_alive():
+                    print("  ⚠️  Escaneo colgado — reconectando y reintentando en 30s...")
+                    try:
+                        self.api.connect()
+                    except Exception:
+                        pass
+                    ultimo_scan = time.time() - CONFIG["rescan_intervalo"] * 60 + 30
+                    continue
+                activos_scan = _resultado[0] if _resultado else []
                 ultimo_scan  = time.time()
 
                 total_revisados = len(self.api.get_all_open_time().get("binary", {})) if activos_scan else 0
@@ -1772,7 +1861,15 @@ class GoldBot:
                 for nombre in list(stop_events):
                     if nombre not in activos_nuevos:
                         stop_events[nombre].set()
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
                         print(f"  🔴 [{nombre}] fuera de payout — hilo detenido")
+
+                # Limpiar hilos muertos del diccionario
+                for nombre in list(hilos_activos):
+                    if not hilos_activos[nombre].is_alive():
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
 
                 # Arrancar hilos para activos nuevos o caídos
                 for activo_info in activos_scan:
@@ -1795,7 +1892,8 @@ class GoldBot:
 
                     print(f"  {activo_info['payout']:>6.1f}%  {activo_info['nombre']:<26}  [{estado}]")
 
-                print(f"\n  👁️  {len(activos_scan)} hilos observando en paralelo")
+                vivos = sum(1 for t in hilos_activos.values() if t.is_alive())
+                print(f"\n  👁️  {vivos} hilos activos observando en paralelo")
 
             time.sleep(10)
 
@@ -1889,93 +1987,35 @@ class GoldBot:
         print(f"  {'─'*80}")
 
     def mostrar_resumen_final(self):
-        """Muestra resumen al detener el bot — lee directo de la DB para reflejar la sesión real"""
-        try:
-            conn = sqlite3.connect(CONFIG["db_file"])
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
+        """Muestra resumen al detener el bot"""
+        stats = self.telemetria.stats_hoy()
+        glob = self.telemetria.stats_global()
 
-            cur.execute("""SELECT COUNT(*) n,
-                           SUM(CASE WHEN resultado_final='win' THEN 1 ELSE 0 END) wins,
-                           SUM(CASE WHEN resultado_final='loss' THEN 1 ELSE 0 END) losses,
-                           SUM(ganancia_neta) neto
-                           FROM ciclos WHERE run_id=? AND resultado_final IN ('win','loss')""",
-                        (self._run_id,))
-            r = dict(cur.fetchone())
-            total  = r['n'] or 0
-            wins   = r['wins'] or 0
-            losses = r['losses'] or 0
-            neto   = r['neto'] or 0.0
-            wr     = wins / total * 100 if total else 0.0
+        print("\n" + "═" * 55)
+        print("  📊 RESUMEN DE SESIÓN")
+        print("═" * 55)
+        print(f"  Operaciones hoy: {stats['total_operaciones']}")
+        print(f"  Wins: {stats['wins']} | Losses: {stats['losses']}")
+        print(f"  Win Rate: {stats['winrate']:.1f}%")
+        print(f"  Ganancia hoy: ${stats['ganancia_total']:+.2f}")
+        print(f"  Mejor racha: {stats['racha_max_win']} wins")
+        print(f"  Peor racha: {stats['racha_max_loss']} losses")
 
-            # Racha máxima
-            cur.execute("""SELECT resultado_final FROM ciclos
-                           WHERE run_id=? AND resultado_final IN ('win','loss')
-                           ORDER BY id""", (self._run_id,))
-            resultados = [row[0] for row in cur.fetchall()]
-            racha_max_win = racha_max_loss = racha_tmp = 0
-            for res in resultados:
-                if res == 'win':
-                    racha_tmp = racha_tmp + 1 if racha_tmp >= 0 else 1
-                    racha_max_win = max(racha_max_win, racha_tmp)
-                else:
-                    racha_tmp = racha_tmp - 1 if racha_tmp <= 0 else -1
-                    racha_max_loss = max(racha_max_loss, abs(racha_tmp))
+        if stats.get("por_activo"):
+            print(f"\n  Por activo:")
+            for act, data in stats["por_activo"].items():
+                wr = data['wins'] / max(data['wins'] + data['losses'], 1) * 100
+                print(f"    {act}: {data['wins']}W/{data['losses']}L "
+                      f"({wr:.0f}%) → ${data['ganancia']:+.2f}")
 
-            # Por paso
-            cur.execute("""SELECT pasos_usados, resultado_final, COUNT(*) n, SUM(ganancia_neta) neto
-                           FROM ciclos WHERE run_id=? AND resultado_final IN ('win','loss')
-                           GROUP BY pasos_usados, resultado_final ORDER BY pasos_usados""",
-                        (self._run_id,))
-            from collections import defaultdict
-            por_paso = defaultdict(lambda: {'wins':0,'losses':0,'neto':0})
-            for row in cur.fetchall():
-                p = row['pasos_usados']
-                por_paso[p]['neto'] += row['neto']
-                if row['resultado_final'] == 'win': por_paso[p]['wins'] += row['n']
-                else: por_paso[p]['losses'] += row['n']
+        if stats.get("por_paso_martingala"):
+            print(f"\n  Por paso de martingala:")
+            for paso, data in sorted(stats["por_paso_martingala"].items()):
+                wr = data['wins'] / max(data['total'], 1) * 100
+                print(f"    Paso {paso}: {data['wins']}W/{data['losses']}L ({wr:.0f}%)")
 
-            # Por activo (top 10 por operaciones)
-            cur.execute("""SELECT activo,
-                           SUM(CASE WHEN resultado_final='win' THEN 1 ELSE 0 END) wins,
-                           SUM(CASE WHEN resultado_final='loss' THEN 1 ELSE 0 END) losses,
-                           SUM(ganancia_neta) neto
-                           FROM ciclos WHERE run_id=? AND resultado_final IN ('win','loss')
-                           GROUP BY activo ORDER BY COUNT(*) DESC LIMIT 10""",
-                        (self._run_id,))
-            por_activo = [dict(row) for row in cur.fetchall()]
-            conn.close()
-
-            print("\n" + "═" * 55)
-            print("  📊 RESUMEN DE SESIÓN")
-            print("═" * 55)
-            print(f"  Run ID:          #{self._run_id}")
-            print(f"  Operaciones:     {total}")
-            print(f"  Wins / Losses:   {wins}W / {losses}L")
-            print(f"  Win Rate:        {wr:.1f}%")
-            print(f"  Ganancia neta:   ${neto:+.2f}")
-            print(f"  Mejor racha:     {racha_max_win} wins")
-            print(f"  Peor racha:      {racha_max_loss} losses")
-
-            if por_paso:
-                print(f"\n  Por paso:")
-                for p in sorted(por_paso):
-                    d = por_paso[p]
-                    n = d['wins'] + d['losses']
-                    wr_p = d['wins'] / n * 100 if n else 0
-                    print(f"    P{p}: {n:>4} ops  {d['wins']}W/{d['losses']}L  WR:{wr_p:>5.1f}%  ${d['neto']:+.2f}")
-
-            if por_activo:
-                print(f"\n  Top activos:")
-                for a in por_activo:
-                    n = a['wins'] + a['losses']
-                    wr_a = a['wins'] / n * 100 if n else 0
-                    print(f"    {a['activo']:<25} {a['wins']}W/{a['losses']}L  ({wr_a:.0f}%)  ${a['neto']:+.2f}")
-
-        except Exception as e:
-            print(f"  ⚠️  Error leyendo resumen de DB: {e}")
-
-        print(f"\n  📁 Log: {CONFIG['log_file']}")
+        print(f"\n  📁 Log guardado en: {CONFIG['log_file']}")
+        print(f"  📁 Stats guardadas en: {CONFIG['stats_file']}")
         print("═" * 55)
 
 

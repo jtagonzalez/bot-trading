@@ -1,0 +1,212 @@
+{
+  "timestamp": "2026-09-21T21:32:29.338725+00:00",
+  "metodo": "verificacion con orden real de $1 en PRACTICE",
+  "activos": [
+    {
+      "activo": "GBPJPY-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "USDJPY-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "NZDUSD-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "GBPUSD-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "USDCHF-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "EURJPY-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "EURGBP-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "CADJPY-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "SHIBUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "IOTAUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "MELANIAUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "FARTCOINUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "BONKUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "FLOKIUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "DYDXUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "LINKUSD-OTC",
+      "tipo": "cripto",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "US30-OTC",
+      "tipo": "indice",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "SP500-OTC",
+      "tipo": "indice",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "AUS200-OTC",
+      "tipo": "indice",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "PENUSD-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "USDCOP-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "USDBRL-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "USDINR-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    },
+    {
+      "activo": "USDMXN-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "HK33-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "USNDAQ100-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "USOUSD-OTC",
+      "tipo": "accion/otro",
+      "otc": true,
+      "payout": 84.0,
+      "operable": false
+    },
+    {
+      "activo": "EURUSD-OTC",
+      "tipo": "divisa",
+      "otc": true,
+      "payout": 84.0,
+      "operable": true
+    }
+  ],
+  "verificados": [
+    "EURGBP-OTC",
+    "EURJPY-OTC",
+    "EURUSD-OTC",
+    "GBPJPY-OTC",
+    "GBPUSD-OTC",
+    "NZDUSD-OTC",
+    "USDCHF-OTC",
+    "USDINR-OTC"
+  ]
+}

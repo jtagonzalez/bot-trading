@@ -1,3 +1,5 @@
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║          ESTRATEGIA GOLD 4.0 v3 — Bot Completo IQ Option        ║
@@ -27,24 +29,59 @@ import signal
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-# ── Logging a archivo ──────────────────────────────────────
+# ── Logging a archivo (thread-safe, shutdown-safe) ──────────────────────────
+import threading as _threading_for_tee
+import atexit as _atexit_for_tee
+
 class _Tee:
-    """Escribe simultáneamente en consola y en archivo de log."""
+    """Escribe en consola y archivo. Thread-safe y resistente a shutdown."""
     def __init__(self, stream, filepath):
         self._stream = stream
         self._file   = open(filepath, "a", encoding="utf-8", errors="replace", buffering=1)
+        self._lock   = _threading_for_tee.Lock()
+        self._closed = False
     def write(self, data):
-        self._stream.write(data)
-        self._file.write(data)
+        if self._closed:
+            try: self._stream.write(data)
+            except Exception: pass
+            return len(data) if data else 0
+        try:
+            with self._lock:
+                self._stream.write(data)
+                if not self._file.closed:
+                    self._file.write(data)
+        except (ValueError, OSError, RuntimeError):
+            pass
+        return len(data) if data else 0
     def flush(self):
-        self._stream.flush()
-        self._file.flush()
+        if self._closed: return
+        try:
+            with self._lock:
+                self._stream.flush()
+                if not self._file.closed:
+                    self._file.flush()
+        except (ValueError, OSError, RuntimeError):
+            pass
+    def close(self):
+        with self._lock:
+            self._closed = True
+            try: self._file.close()
+            except Exception: pass
     def __getattr__(self, attr):
         return getattr(self._stream, attr)
 
-_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_log.txt")
-sys.stdout = _Tee(sys.stdout, _log_path)
-sys.stderr = _Tee(sys.stderr, _log_path)
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_indicadores_log.txt")
+_tee_out = _Tee(sys.stdout, _log_path)
+_tee_err = _Tee(sys.stderr, _log_path)
+sys.stdout = _tee_out
+sys.stderr = _tee_err
+
+def _cleanup_tee():
+    try: _tee_out.close()
+    except: pass
+    try: _tee_err.close()
+    except: pass
+_atexit_for_tee.register(_cleanup_tee)
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -74,9 +111,18 @@ CONFIG = {
     "num_velas": 200,
 
     # --- Martingala ---
-    "martingala_activa": True,
+    # DESACTIVADA (2026-09-20). Con WR real 52.74% y breakeven 54.36% la martingala
+    # no crea edge: solo convierte una pérdida constante en pérdidas raras y enormes
+    # (-$135.76 por ciclo a 6 pasos). Volver a activarla SOLO cuando el backtester
+    # demuestre WR > 54.36% out-of-sample. Ver backtest.py.
+    "martingala_activa": False,
     "multiplicador": 2.4,             # Multiplicador tras pérdida
-    "max_pasos": 6,                   # Máx entradas: 1 original + 5 martingala
+    "max_pasos": 1,                   # 1 = una entrada por señal, sin recuperación
+
+    # --- Universo de activos ---
+    # True  = solo mercado real (excluye -OTC, sintéticos generados por el broker)
+    # False = permite OTC (comportamiento anterior)
+    "solo_mercado_real": True,
 
     # --- Indicadores ---
     "sma_rapida": 3,
@@ -84,7 +130,7 @@ CONFIG = {
 
     # --- Filtros de la estrategia ---
     "porcentaje_cuerpo": 0.60,          # % mínimo del cuerpo sobre/bajo SMA3
-    "max_mecha_ratio": 0.5,          # mechas máx como múltiplo del cuerpo
+    "max_mecha_ratio": 1.0,             # mechas máx como múltiplo del cuerpo
     "velas_inclinacion": 3,
     "separacion_minima": 0.0000,
     # Pullback: al menos 1 vela contraria en las últimas 5 con cuerpo >= cuerpo de la vela señal
@@ -92,7 +138,7 @@ CONFIG = {
     # --- Telemetría ---
     "log_file": "telemetria.json",
     "stats_file": "estadisticas.json",
-    "db_file": "gold_bot.db",
+    "db_file": "bot_indicadores.db",
     "dashboard_port": 8080,
 
     # --- Gestión de riesgo ---
@@ -118,9 +164,229 @@ def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period, min_periods=period).mean()
 
 
+def _safe_float(x, default=0.0):
+    try:
+        v = float(x)
+        if pd.isna(v) or np.isinf(v): return default
+        return v
+    except Exception:
+        return default
+
+
+def calcular_indicadores_extra(df: pd.DataFrame) -> dict:
+    """
+    Calcula un set rico de indicadores sobre la última vela cerrada (df.iloc[-2]).
+    No modifica la lógica de entrada — solo extrae datos para análisis posterior.
+    Se basa solo en OHLC: no requiere llamadas extra a la API.
+    """
+    try:
+        close = df["close"]
+        high  = df["high"]
+        low   = df["low"]
+        open_ = df["open"]
+        n = len(df)
+        if n < 30:
+            return {}
+
+        i = -2  # vela cerrada (la señal)
+
+        # ── Momentum ──
+        # RSI(14)
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).rolling(14, min_periods=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi14 = 100 - (100 / (1 + rs))
+
+        # RSI(7) — más reactivo
+        gain7 = delta.where(delta > 0, 0).rolling(7, min_periods=7).mean()
+        loss7 = (-delta.where(delta < 0, 0)).rolling(7, min_periods=7).mean()
+        rs7 = gain7 / loss7.replace(0, np.nan)
+        rsi7 = 100 - (100 / (1 + rs7))
+
+        # Stochastic(14, 3)
+        low14 = low.rolling(14).min()
+        high14 = high.rolling(14).max()
+        stoch_k = 100 * (close - low14) / (high14 - low14).replace(0, np.nan)
+        stoch_d = stoch_k.rolling(3).mean()
+
+        # Williams %R(14)
+        will_r = -100 * (high14 - close) / (high14 - low14).replace(0, np.nan)
+
+        # ROC(10) — Rate of Change
+        roc10 = (close / close.shift(10) - 1) * 100
+
+        # ── Tendencia / EMAs y SMAs adicionales ──
+        sma10 = close.rolling(10).mean()
+        sma20 = close.rolling(20).mean()
+        sma100 = close.rolling(min(100, n - 1)).mean() if n > 100 else close.rolling(n - 1).mean()
+        ema9 = close.ewm(span=9, adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+
+        # MACD(12, 26, 9)
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - macd_signal
+
+        # ── Volatilidad ──
+        # ATR(14)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr14 = tr.rolling(14, min_periods=14).mean()
+        # ATR ratio: volatilidad actual vs media de 50 velas
+        atr50_avg = atr14.rolling(50, min_periods=14).mean()
+        atr_ratio = atr14 / atr50_avg.replace(0, np.nan)
+
+        # Bollinger Bands(20, 2)
+        bb_mid = sma20
+        bb_std = close.rolling(20).std()
+        bb_up = bb_mid + 2 * bb_std
+        bb_dn = bb_mid - 2 * bb_std
+        # Posición dentro de banda: 0 = banda inferior, 1 = banda superior
+        bb_pct = (close - bb_dn) / (bb_up - bb_dn).replace(0, np.nan)
+        bb_width = (bb_up - bb_dn) / bb_mid.replace(0, np.nan)
+
+        # ── ADX(14) — fuerza de tendencia ──
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0)
+        plus_di = 100 * plus_dm.rolling(14, min_periods=14).mean() / atr14.replace(0, np.nan)
+        minus_di = 100 * minus_dm.rolling(14, min_periods=14).mean() / atr14.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx14 = dx.rolling(14, min_periods=14).mean()
+
+        # ── CCI(20) ──
+        tp = (high + low + close) / 3
+        cci_sma = tp.rolling(20).mean()
+        cci_md = (tp - cci_sma).abs().rolling(20).mean()
+        cci20 = (tp - cci_sma) / (0.015 * cci_md.replace(0, np.nan))
+
+        # ── Distancias y rangos ──
+        high20 = high.rolling(20).max()
+        low20 = low.rolling(20).min()
+        rng20 = high20 - low20
+        pos_in_range20 = (close - low20) / rng20.replace(0, np.nan)
+        dist_high20_pct = (high20 - close) / close * 100
+        dist_low20_pct  = (close - low20) / close * 100
+
+        # ── Cuerpo / mecha contexto ──
+        body = (close - open_).abs()
+        body_avg20 = body.rolling(20).mean()
+        body_ratio = body / body_avg20.replace(0, np.nan)
+
+        wick_top = high - pd.concat([open_, close], axis=1).max(axis=1)
+        wick_bot = pd.concat([open_, close], axis=1).min(axis=1) - low
+        # 1.0 = todo arriba, 0.0 = balanceado, -1.0 = todo abajo
+        wick_total = wick_top + wick_bot
+        wick_asym = (wick_top - wick_bot) / wick_total.replace(0, np.nan)
+
+        # ── Patrones recientes ──
+        last10 = df.iloc[max(0, n - 11):n - 1]
+        bull_count10 = int((last10["close"] > last10["open"]).sum())
+        bear_count10 = int((last10["close"] < last10["open"]).sum())
+
+        # Racha consecutiva (en velas previas a la señal)
+        racha = 0
+        es_alcista_signal = bool(close.iloc[i] > open_.iloc[i])
+        for j in range(i - 1, max(-1, i - 11), -1):
+            ja = bool(close.iloc[j] > open_.iloc[j])
+            if ja == es_alcista_signal:
+                racha += 1
+            else:
+                break
+
+        # Slope de regresión lineal sobre últimas 20 velas
+        try:
+            ys = close.iloc[max(0, i - 19):i + 1].values
+            xs = np.arange(len(ys))
+            slope20 = np.polyfit(xs, ys, 1)[0] if len(ys) > 1 else 0
+            slope20_pct = (slope20 / close.iloc[i]) * 100 if close.iloc[i] else 0
+        except Exception:
+            slope20_pct = 0
+
+        # ── Posición relativa de SMAs ──
+        sma3_v = df["sma_rapida"].iloc[i] if "sma_rapida" in df else sma(close, 3).iloc[i]
+        sma50_v = df["sma_tendencia"].iloc[i] if "sma_tendencia" in df else sma(close, 50).iloc[i]
+
+        # ── Tiempo ──
+        ahora = datetime.now()
+
+        return {
+            "rsi7":            _safe_float(rsi7.iloc[i]),
+            "rsi14":           _safe_float(rsi14.iloc[i]),
+            "stoch_k":         _safe_float(stoch_k.iloc[i]),
+            "stoch_d":         _safe_float(stoch_d.iloc[i]),
+            "williams_r":      _safe_float(will_r.iloc[i]),
+            "roc10":           _safe_float(roc10.iloc[i]),
+            "macd_line":       _safe_float(macd_line.iloc[i]),
+            "macd_signal":     _safe_float(macd_signal.iloc[i]),
+            "macd_hist":       _safe_float(macd_hist.iloc[i]),
+            "atr14":           _safe_float(atr14.iloc[i]),
+            "atr_ratio":       _safe_float(atr_ratio.iloc[i], default=1.0),
+            "bb_pct":          _safe_float(bb_pct.iloc[i], default=0.5),
+            "bb_width":        _safe_float(bb_width.iloc[i]),
+            "adx14":           _safe_float(adx14.iloc[i]),
+            "plus_di":         _safe_float(plus_di.iloc[i]),
+            "minus_di":        _safe_float(minus_di.iloc[i]),
+            "cci20":           _safe_float(cci20.iloc[i]),
+            "ema9":            _safe_float(ema9.iloc[i]),
+            "ema21":           _safe_float(ema21.iloc[i]),
+            "sma10":           _safe_float(sma10.iloc[i]),
+            "sma20":           _safe_float(sma20.iloc[i]),
+            "sma100":          _safe_float(sma100.iloc[i]),
+            "ema_diff_pct":    _safe_float((ema9.iloc[i] - ema21.iloc[i]) / close.iloc[i] * 100),
+            "dist_sma50_pct":  _safe_float((close.iloc[i] - sma50_v) / close.iloc[i] * 100),
+            "dist_sma100_pct": _safe_float((close.iloc[i] - sma100.iloc[i]) / close.iloc[i] * 100),
+            "pos_in_range20":  _safe_float(pos_in_range20.iloc[i], default=0.5),
+            "dist_high20_pct": _safe_float(dist_high20_pct.iloc[i]),
+            "dist_low20_pct":  _safe_float(dist_low20_pct.iloc[i]),
+            "body_ratio":      _safe_float(body_ratio.iloc[i], default=1.0),
+            "wick_asym":       _safe_float(wick_asym.iloc[i]),
+            "bull_count10":    bull_count10,
+            "bear_count10":    bear_count10,
+            "racha_misma_dir": racha,
+            "slope20_pct":     _safe_float(slope20_pct),
+            "hora":            ahora.hour,
+            "minuto":          ahora.minute,
+            "dia_semana":      ahora.weekday(),  # 0=lunes
+        }
+    except Exception as e:
+        print(f"  ⚠️ Error calculando indicadores extra: {e}")
+        return {}
+
+
 # ═══════════════════════════════════════════════
 # SEÑALES DE LA ESTRATEGIA
 # ═══════════════════════════════════════════════
+
+def _precio_cierre_de_msg(msg: dict):
+    """Extrae el precio de cierre del mensaje socket_option_closed de IQ Option.
+
+    El esquema no está documentado y varía entre versiones de la API, así que se
+    prueban los nombres de campo conocidos. Devuelve None si ninguno aparece.
+    Sin esto `precio_salida` quedaba siempre NULL y era imposible medir CUÁNTO se
+    movió el precio (solo si ganó o perdió), que es el dato con más poder
+    estadístico para evaluar indicadores.
+    """
+    if not isinstance(msg, dict):
+        return None
+    for k in ("close_quote", "closeQuote", "close_price", "currentPrice",
+              "current_price", "quote", "price", "value"):
+        v = msg.get(k)
+        try:
+            if v is not None and float(v) > 0:
+                return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
 
 def calcular_señales(df: pd.DataFrame) -> pd.DataFrame:
     df["sma_rapida"] = sma(df["close"], CONFIG["sma_rapida"])
@@ -421,7 +687,7 @@ class Database:
         self._init()
 
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")  # permite lecturas concurrentes
         return conn
@@ -550,6 +816,90 @@ class Database:
                     gano_p1          INTEGER,
                     gano_p2          INTEGER
                 );
+
+                CREATE TABLE IF NOT EXISTS resultados_simple (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ciclo_id          INTEGER,
+                    run_id            INTEGER,
+                    timestamp_inicio  TEXT NOT NULL,
+                    timestamp_fin     TEXT,
+                    hora              INTEGER,
+                    activo            TEXT NOT NULL,
+                    direccion         TEXT,
+                    num_martingalas   INTEGER,
+                    resultado         TEXT,
+                    ganancia_neta     REAL,
+                    monto_maximo      REAL,
+                    imagen            TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS indicadores_completos (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ciclo_id            INTEGER,
+                    run_id              INTEGER,
+                    timestamp           TEXT NOT NULL,
+                    activo              TEXT NOT NULL,
+                    direccion           TEXT,
+                    payout              REAL,
+                    precio_entrada      REAL,
+                    -- Originales del bot
+                    sma3                REAL,
+                    sma50               REAL,
+                    distancia_smas      REAL,
+                    pct_cuerpo          REAL,
+                    ratio_mechas        REAL,
+                    -- Momentum
+                    rsi7                REAL,
+                    rsi14               REAL,
+                    stoch_k             REAL,
+                    stoch_d             REAL,
+                    williams_r          REAL,
+                    roc10               REAL,
+                    -- MACD
+                    macd_line           REAL,
+                    macd_signal         REAL,
+                    macd_hist           REAL,
+                    -- Volatilidad
+                    atr14               REAL,
+                    atr_ratio           REAL,
+                    bb_pct              REAL,
+                    bb_width            REAL,
+                    -- Tendencia
+                    adx14               REAL,
+                    plus_di             REAL,
+                    minus_di            REAL,
+                    cci20               REAL,
+                    ema9                REAL,
+                    ema21               REAL,
+                    sma10               REAL,
+                    sma20               REAL,
+                    sma100              REAL,
+                    ema_diff_pct        REAL,
+                    dist_sma50_pct      REAL,
+                    dist_sma100_pct     REAL,
+                    -- Rango / posicion
+                    pos_in_range20      REAL,
+                    dist_high20_pct     REAL,
+                    dist_low20_pct      REAL,
+                    -- Cuerpo / vela contexto
+                    body_ratio          REAL,
+                    wick_asym           REAL,
+                    -- Patrones
+                    bull_count10        INTEGER,
+                    bear_count10        INTEGER,
+                    racha_misma_dir     INTEGER,
+                    slope20_pct         REAL,
+                    -- Tiempo
+                    hora                INTEGER,
+                    minuto              INTEGER,
+                    dia_semana          INTEGER,
+                    -- Resultado (se llena al cerrar el ciclo)
+                    pasos_usados        INTEGER,
+                    resultado_final     TEXT,
+                    ganancia_neta       REAL,
+                    gano_p1             INTEGER,
+                    precio_salida       REAL
+                );
             """)
 
     # ── Indicadores ───────────────────────────────
@@ -574,8 +924,86 @@ class Database:
                  1 if datos.get("gano_p2") else 0)
             )
 
+    def registrar_resultado_simple(self, datos: dict) -> int:
+        """Tabla simple: una fila por ciclo cerrado (win/loss)."""
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO resultados_simple
+                   (ciclo_id, run_id, timestamp_inicio, timestamp_fin, hora,
+                    activo, direccion, num_martingalas, resultado,
+                    ganancia_neta, monto_maximo, imagen)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datos.get("ciclo_id"), datos.get("run_id"),
+                 datos.get("timestamp_inicio"), datos.get("timestamp_fin"),
+                 datos.get("hora"),
+                 datos.get("activo"), datos.get("direccion"),
+                 datos.get("num_martingalas"), datos.get("resultado"),
+                 datos.get("ganancia_neta"), datos.get("monto_maximo"),
+                 datos.get("imagen"))
+            )
+            return cur.lastrowid
+
+    def registrar_indicadores_completos(self, datos: dict) -> int:
+        """Tabla rica: todos los indicadores tecnicos en el momento de la senal."""
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO indicadores_completos
+                   (ciclo_id, run_id, timestamp, activo, direccion, payout, precio_entrada,
+                    sma3, sma50, distancia_smas, pct_cuerpo, ratio_mechas,
+                    rsi7, rsi14, stoch_k, stoch_d, williams_r, roc10,
+                    macd_line, macd_signal, macd_hist,
+                    atr14, atr_ratio, bb_pct, bb_width,
+                    adx14, plus_di, minus_di, cci20,
+                    ema9, ema21, sma10, sma20, sma100,
+                    ema_diff_pct, dist_sma50_pct, dist_sma100_pct,
+                    pos_in_range20, dist_high20_pct, dist_low20_pct,
+                    body_ratio, wick_asym,
+                    bull_count10, bear_count10, racha_misma_dir, slope20_pct,
+                    hora, minuto, dia_semana)
+                   VALUES (?,?,?,?,?,?,?,
+                           ?,?,?,?,?,
+                           ?,?,?,?,?,?,
+                           ?,?,?,
+                           ?,?,?,?,
+                           ?,?,?,?,
+                           ?,?,?,?,?,
+                           ?,?,?,
+                           ?,?,?,
+                           ?,?,
+                           ?,?,?,?,
+                           ?,?,?)""",
+                (datos.get("ciclo_id"), datos.get("run_id"), datetime.now().isoformat(),
+                 datos["activo"], datos["direccion"], datos.get("payout"), datos.get("precio_entrada"),
+                 datos.get("sma3"), datos.get("sma50"), datos.get("distancia_smas"),
+                 datos.get("pct_cuerpo"), datos.get("ratio_mechas"),
+                 datos.get("rsi7"), datos.get("rsi14"), datos.get("stoch_k"), datos.get("stoch_d"),
+                 datos.get("williams_r"), datos.get("roc10"),
+                 datos.get("macd_line"), datos.get("macd_signal"), datos.get("macd_hist"),
+                 datos.get("atr14"), datos.get("atr_ratio"), datos.get("bb_pct"), datos.get("bb_width"),
+                 datos.get("adx14"), datos.get("plus_di"), datos.get("minus_di"), datos.get("cci20"),
+                 datos.get("ema9"), datos.get("ema21"), datos.get("sma10"), datos.get("sma20"), datos.get("sma100"),
+                 datos.get("ema_diff_pct"), datos.get("dist_sma50_pct"), datos.get("dist_sma100_pct"),
+                 datos.get("pos_in_range20"), datos.get("dist_high20_pct"), datos.get("dist_low20_pct"),
+                 datos.get("body_ratio"), datos.get("wick_asym"),
+                 datos.get("bull_count10"), datos.get("bear_count10"),
+                 datos.get("racha_misma_dir"), datos.get("slope20_pct"),
+                 datos.get("hora"), datos.get("minuto"), datos.get("dia_semana"))
+            )
+            return cur.lastrowid
+
+    def actualizar_indicadores_resultado(self, ciclo_id: int, pasos: int, resultado: str, ganancia: float, precio_salida: float = None):
+        """Actualiza el resultado del ciclo en la tabla rica para entrenamiento."""
+        gano_p1 = 1 if (pasos == 1 and resultado == "win") else 0
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE indicadores_completos
+                   SET pasos_usados=?, resultado_final=?, ganancia_neta=?, gano_p1=?, precio_salida=?
+                   WHERE ciclo_id=?""",
+                (pasos, resultado, ganancia, gano_p1, precio_salida, ciclo_id)
+            )
+
     def registrar_ciclo_6pasos(self, datos: dict):
-        """Guarda un ciclo completo de la estrategia 6 pasos (mismo activo) en ciclos_6pasos y horas_24."""
+        """Guarda ciclo en ciclos_6pasos y en run_16 (tabla aislada de esta estrategia)."""
         ts_fin = datetime.now().isoformat()
         params = (datos.get("run_id"), datos["activo"], datos["direccion"],
                   datos.get("timestamp_inicio"), ts_fin,
@@ -586,7 +1014,7 @@ class Database:
                   datos.get("sma3"), datos.get("sma50"), datos.get("distancia_smas"),
                   datos.get("pct_cuerpo"), datos.get("ratio_mechas"),
                   json.dumps(datos.get("pasos_json", [])))
-        sql = """({tabla})
+        sql = """INSERT INTO {tabla}
                    (run_id, activo, direccion, timestamp_inicio, timestamp_fin,
                     pasos_usados, resultado_final, ganancia_neta,
                     monto_inicial, monto_maximo, payout_inicial,
@@ -594,11 +1022,8 @@ class Database:
                     pasos_json)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
         with self._lock, self._conn() as conn:
-            conn.execute(sql.format(tabla="INSERT INTO ciclos_6pasos"), params)
-            try:
-                conn.execute(sql.format(tabla="INSERT INTO horas_24"), params)
-            except Exception:
-                pass
+            conn.execute(sql.format(tabla="ciclos_6pasos"), params)
+            conn.execute(sql.format(tabla="run_16"), params)
 
     def registrar_ciclo_flotante(self, datos: dict):
         """Guarda un ciclo de martingala flotante (multi-activo) en su tabla propia."""
@@ -760,8 +1185,27 @@ class Database:
                 "operaciones": rows[:20],
             }
 
-        ops_hoy   = self.query("SELECT * FROM operaciones WHERE timestamp LIKE ? ORDER BY id DESC", (f"{hoy}%",))
-        ops_todas = self.query("SELECT * FROM operaciones ORDER BY id DESC LIMIT 500")
+        # NOTA: se lee de `ciclos`, no de `operaciones`.
+        # `operaciones` solo la escribe registrar_ciclo_completo(), que ya no se
+        # invoca desde el flujo de trading -> quedaba siempre vacia y el
+        # dashboard no mostraba nada en tiempo real.
+        SEL = """SELECT id,
+                        activo            AS par,
+                        direccion,
+                        timestamp_inicio  AS timestamp,
+                        resultado_final   AS resultado,
+                        ganancia_neta,
+                        ganancia_neta     AS ganancia,
+                        pasos_usados      AS pasos_martingala,
+                        monto_maximo,
+                        monto_inicial,
+                        payout_inicial,
+                        run_id
+                   FROM ciclos
+                  WHERE resultado_final IN ('win','loss','tie')"""
+
+        ops_hoy   = self.query(SEL + " AND timestamp_inicio LIKE ? ORDER BY id DESC", (f"{hoy}%",))
+        ops_todas = self.query(SEL + " ORDER BY id DESC LIMIT 500")
         return {"hoy": agg(ops_hoy), "global": agg(ops_todas)}
 
 
@@ -850,6 +1294,8 @@ class GoldBot:
         self._trades_activos = set()
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        self._red_ok = threading.Event()   # set = conexión activa, clear = sin red
+        self._red_ok.set()
         self._sem_paralelo = threading.Semaphore(10)
 
         self._estado_activos: dict[str, str] = {}
@@ -962,7 +1408,15 @@ class GoldBot:
             payout = round(payout, 1)
             califica = payout >= CONFIG["payout_minimo"]
 
-            # publicar progreso en tiempo real
+            # Los activos "-op" producían el 7% de los ciclos en estado error/cancelado
+            # (ETHUSD-op, XRPUSD-op, MORSTAN-op...): la API no devuelve resultado fiable.
+            if activo.endswith("-op"):
+                califica = False
+            # Los "-OTC" los genera el broker, no cotizan en mercado interbancario.
+            if CONFIG.get("solo_mercado_real") and "-OTC" in activo.upper():
+                califica = False
+
+            # publicar progreso en tiempo real (ya con el filtro aplicado)
             self._scan_progress["activos"].append({
                 "nombre": activo,
                 "payout": payout,
@@ -1009,11 +1463,27 @@ class GoldBot:
         # Siempre descarga 200 velas completas — el fetch incremental de 3 velas
         # era susceptible a contaminación del buffer WebSocket con precios de
         # otros activos, causando entradas falsas y martingalas incorrectas.
-        with _candles_lock:
-            velas = self.api.get_candles(
-                activo, CONFIG["timeframe"],
-                CONFIG["num_velas"], time.time()
-            )
+        # Timeout fuera del lock: cada hilo tiene su propio fetch con límite de 15s.
+        # El lock solo protege el acceso al buffer WebSocket, no el tiempo de espera.
+        resultado = []
+        def _fetch():
+            try:
+                with _candles_lock:
+                    data = self.api.get_candles(
+                        activo, CONFIG["timeframe"],
+                        CONFIG["num_velas"], time.time()
+                    )
+                resultado.append(data)
+            except Exception as e:
+                resultado.append(e)
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
+        t.join(timeout=15)
+        if not resultado:
+            raise TimeoutError(f"get_candles timeout para {activo}")
+        if isinstance(resultado[0], Exception):
+            raise resultado[0]
+        velas = resultado[0]
         df = pd.DataFrame(velas)
         df = df.rename(columns={
             "open": "open", "close": "close",
@@ -1088,7 +1558,7 @@ class GoldBot:
         Espera el vencimiento y obtiene el resultado REAL de IQ Option via
         buy_order_changed[order_id]. Solo usa comparación de velas como fallback.
 
-        Retorna: ganancia neta (positivo=WIN, 0=TIE, negativo=LOSS)
+        Retorna: (ganancia_neta, precio_cierre) — precio_cierre puede ser None si vino por socket
         """
         tf = CONFIG["timeframe"]
         expira_en = CONFIG["expiracion"] * tf  # segundos nominales
@@ -1105,6 +1575,10 @@ class GoldBot:
             while True:
                 if self._stop_event.is_set():
                     break
+                # Conexión caída después de la expiración → no hay forma de recuperar resultado
+                if not self._red_ok.is_set() and time.time() - t_inicio > expira_en:
+                    print(f"\n   ⚠️ [{activo}] Conexión caída tras expiración — asumiendo LOSS")
+                    return -monto, None
                 elapsed  = time.time() - t_inicio
                 restante = expira_en - elapsed
 
@@ -1121,16 +1595,17 @@ class GoldBot:
                         print()  # salto de línea tras el \r
                         msg     = raw.get("msg", {}) if isinstance(raw, dict) else {}
                         win_str = str(msg.get("win", "")).lower()
+                        p_cierre = _precio_cierre_de_msg(msg)
                         if win_str == "win":
                             ganancia = round(float(msg.get("win_amount", 0)) - float(msg.get("sum", monto)), 4)
                             print(f"   🏆 [{activo}] WIN +${ganancia:.4f}")
-                            return ganancia
+                            return ganancia, p_cierre
                         elif win_str == "equal":
                             print(f"   ⚖️  [{activo}] TIE — empate")
-                            return 0.0
+                            return 0.0, p_cierre
                         else:
                             print(f"   ❌ [{activo}] LOSS")
-                            return -monto
+                            return -monto, p_cierre
                 except Exception as e:
                     print(f"\n   ⚠️ [{activo}] socket error: {e}")
 
@@ -1161,12 +1636,12 @@ class GoldBot:
 
         if not precio_cierre:
             print(f"   ⚠️ [{activo}] Sin precio de cierre — asumiendo LOSS")
-            return -monto
+            return -monto, None
 
         diferencia = precio_cierre - precio_entrada
         if abs(diferencia) < 0.0001:
             print(f"   ⚠️ [{activo}] diff={diferencia:+.5f} muy pequeño — LOSS")
-            return -monto
+            return -monto, precio_cierre
 
         if (direccion == "call" and diferencia > 0) or (direccion == "put" and diferencia < 0):
             ganancia = round(monto * (payout / 100), 4)
@@ -1177,7 +1652,7 @@ class GoldBot:
 
         print(f"   📊 [{activo}] entrada={precio_entrada:.5f} → cierre={precio_cierre:.5f} "
               f"| diff={diferencia:+.5f} | {res} {'+' if ganancia>=0 else ''}{ganancia:.4f}")
-        return ganancia
+        return ganancia, precio_cierre
 
     # ─────────────────────────────────────
     # EJECUTAR UNA OPERACIÓN INDIVIDUAL
@@ -1247,7 +1722,7 @@ class GoldBot:
             pass
 
         # — Esperar y calcular resultado por precio —
-        resultado_valor = self._obtener_resultado_orden(
+        resultado_valor, precio_salida = self._obtener_resultado_orden(
             order_id, activo, precio_entrada, direccion, monto, payout, api=api
         )
 
@@ -1279,18 +1754,21 @@ class GoldBot:
             "resultado":       resultado,
             "ganancia":        resultado_valor,
             "precio_entrada":  precio_entrada,
+            "precio_salida":   precio_salida,
         }
 
     # ─────────────────────────────────────
     # CICLO COMPLETO: TRADE + MARTINGALA
     # ─────────────────────────────────────
 
-    def _ciclo_trade(self, activo: str, direccion: str, vela_data: dict, ruta_captura: str = ""):
+    def _ciclo_trade(self, activo: str, direccion: str, vela_data: dict,
+                     ruta_captura: str = "", indicadores_extra: dict = None):
         """
         Ejecuta un ciclo completo (paso 1 + martingala en el MISMO activo hasta max_pasos).
         - WIN en cualquier paso → cierra el ciclo
         - LOSS en el último paso → ciclo perdido
         """
+        indicadores_extra = indicadores_extra or {}
         payout = self.obtener_payout_actual(activo)
         if payout < CONFIG["payout_minimo"]:
             print(f"   ⚠️ [{activo}] Payout {payout}% insuficiente — ciclo cancelado")
@@ -1307,21 +1785,74 @@ class GoldBot:
             pasos_detalle   = []
             monto_maximo    = monto
 
+            # ── Guardar TODOS los indicadores tecnicos al iniciar (independiente del resultado) ──
+            try:
+                self.db.registrar_indicadores_completos({
+                    "ciclo_id": ciclo_id, "run_id": self._run_id,
+                    "activo": activo, "direccion": direccion,
+                    "payout": payout, "precio_entrada": precio_apertura,
+                    "sma3": vela_data.get("sma3"), "sma50": vela_data.get("sma50"),
+                    "distancia_smas": vela_data.get("distancia_smas"),
+                    "pct_cuerpo": vela_data.get("pct_cuerpo"),
+                    "ratio_mechas": vela_data.get("ratio_mechas"),
+                    **indicadores_extra,
+                })
+            except Exception as e:
+                print(f"   ⚠️ Error guardando indicadores completos: {e}")
+
             print(f"\n{'─'*55}")
             print(f"   🎯 CICLO [{activo}] {direccion.upper()} | ${monto:.2f} | payout:{payout}%")
             print(f"{'─'*55}")
 
             for paso in range(1, CONFIG["max_pasos"] + 1):
                 if paso > 1:
+                    # Abortar martingala si la conexión cayó
+                    if not self._red_ok.is_set():
+                        print(f"   ⚠️ [{activo}] Conexión caída en P{paso} — abortando martingala")
+                        self.db.cerrar_ciclo(ciclo_id, "cancelado", ganancia_neta, paso - 1, monto_maximo)
+                        ruta_final = self._renombrar_captura(ruta_captura, "loss", paso - 1, activo, ts_inicio)
+                        self._registrar_resultado_simple(ciclo_id, ts_inicio, activo, direccion,
+                                                         paso - 1, "cancelado", ganancia_neta, monto_maximo, ruta_final)
+                        try: self.db.actualizar_indicadores_resultado(ciclo_id, paso - 1, "cancelado", ganancia_neta)
+                        except Exception: pass
+                        return
+
                     print(f"\n   🔄 [{activo}] MARTINGALA P{paso} | ${monto:.2f}")
-
-                res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
-                                          ciclo_id, vela_data, api=api)
-
-                if not res["ejecutada"]:
-                    self.db.cerrar_ciclo(ciclo_id, "error", ganancia_neta, paso, monto_maximo)
-                    self._renombrar_captura(ruta_captura, "loss")
-                    return
+                    # Intentar martingala durante máximo 2 minutos
+                    t_limite = time.time() + 120
+                    res = None
+                    while time.time() < t_limite:
+                        if not self._red_ok.is_set():
+                            break
+                        res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
+                                                  ciclo_id, vela_data, api=api)
+                        if res["ejecutada"]:
+                            break
+                        restante = int(t_limite - time.time())
+                        if restante <= 0:
+                            break
+                        print(f"   ⏳ [{activo}] P{paso} reintentando martingala ({restante}s restantes)...")
+                        time.sleep(5)
+                    if res is None or not res["ejecutada"]:
+                        print(f"   ⏱️  [{activo}] P{paso} tiempo agotado (2min) — ciclo finalizado")
+                        self.db.cerrar_ciclo(ciclo_id, "cancelado", ganancia_neta, paso - 1, monto_maximo)
+                        ruta_final = self._renombrar_captura(ruta_captura, "loss", paso - 1, activo, ts_inicio)
+                        self._registrar_resultado_simple(ciclo_id, ts_inicio, activo, direccion,
+                                                         paso - 1, "cancelado", ganancia_neta, monto_maximo, ruta_final)
+                        try: self.db.actualizar_indicadores_resultado(ciclo_id, paso - 1, "cancelado", ganancia_neta)
+                        except Exception: pass
+                        return
+                else:
+                    res = self._ejecutar_paso(activo, direccion, monto, payout, paso,
+                                              ciclo_id, vela_data, api=api)
+                    if not res["ejecutada"]:
+                        self.db.cerrar_ciclo(ciclo_id, "error", ganancia_neta, paso, monto_maximo)
+                        ruta_final = self._renombrar_captura(ruta_captura, "loss", paso, activo, ts_inicio)
+                        self._registrar_resultado_simple(ciclo_id, ts_inicio, activo, direccion,
+                                                         paso, "error", ganancia_neta, monto_maximo, ruta_final)
+                        try: self.db.actualizar_indicadores_resultado(ciclo_id, paso, "error", ganancia_neta, res.get("precio_salida"))
+                        except Exception: pass
+                        return
 
                 if paso == 1:
                     precio_apertura = res.get("precio_entrada", precio_apertura)
@@ -1347,7 +1878,11 @@ class GoldBot:
                         CONFIG["monto_base"], monto_maximo, pasos_detalle, [activo],
                         vela_data={**vela_data, "payout": payout}
                     )
-                    self._renombrar_captura(ruta_captura, "win")
+                    ruta_final = self._renombrar_captura(ruta_captura, "win", paso, activo, ts_inicio)
+                    self._registrar_resultado_simple(ciclo_id, ts_inicio, activo, direccion,
+                                                     paso, "win", ganancia_neta, monto_maximo, ruta_final)
+                    try: self.db.actualizar_indicadores_resultado(ciclo_id, paso, "win", ganancia_neta, res.get("precio_salida"))
+                    except Exception: pass
                     print(f"   ✅ [{activo}] WIN en P{paso} | Neto: ${ganancia_neta:+.2f}")
                     return
 
@@ -1359,7 +1894,11 @@ class GoldBot:
                         CONFIG["monto_base"], monto_maximo, pasos_detalle, [activo],
                         vela_data={**vela_data, "payout": payout}
                     )
-                    self._renombrar_captura(ruta_captura, "loss")
+                    ruta_final = self._renombrar_captura(ruta_captura, "loss", paso, activo, ts_inicio)
+                    self._registrar_resultado_simple(ciclo_id, ts_inicio, activo, direccion,
+                                                     paso, "loss", ganancia_neta, monto_maximo, ruta_final)
+                    try: self.db.actualizar_indicadores_resultado(ciclo_id, paso, "loss", ganancia_neta, res.get("precio_salida"))
+                    except Exception: pass
                     print(f"   💀 [{activo}] LOSS — {paso} pasos agotados | Neto: ${ganancia_neta:+.2f}")
                     return
 
@@ -1507,7 +2046,7 @@ class GoldBot:
             import matplotlib.patches as mpatches
             import os
 
-            carpeta = f"capturas_6p/{direccion.upper()}"
+            carpeta = f"capturas_indicadores/{direccion.upper()}"
             os.makedirs(carpeta, exist_ok=True)
 
             vista = df.iloc[-11:-1].copy()
@@ -1588,18 +2127,58 @@ class GoldBot:
             print(f"  ⚠️ [{activo}] Error generando captura: {e}")
             return ""
 
-    def _renombrar_captura(self, ruta: str, resultado: str):
-        """Agrega _WIN o _LOSS al nombre del archivo al cerrar el ciclo."""
+    def _renombrar_captura(self, ruta: str, resultado: str, pasos: int = 1,
+                           activo: str = "", ts_inicio: str = ""):
+        """Renombra captura agregando hora, activo, paso y resultado.
+        Formato: HH-MM_ACTIVO_P{N}_{WIN|LOSS}.png"""
         if not ruta:
-            return
+            return ""
         try:
             import os
-            sufijo = "_WIN" if resultado == "win" else "_LOSS"
-            base, ext = os.path.splitext(ruta)
-            nueva = f"{base}{sufijo}{ext}"
-            os.rename(ruta, nueva)
+            sufijo = "WIN" if resultado == "win" else "LOSS"
+            try:
+                hora = ts_inicio[11:16].replace(":", "-") if ts_inicio else datetime.now().strftime("%H-%M")
+            except Exception:
+                hora = datetime.now().strftime("%H-%M")
+            activo_clean = (activo or "").replace("/", "_")
+            carpeta = os.path.dirname(ruta)
+            ext = os.path.splitext(ruta)[1] or ".png"
+            nuevo_nombre = f"{hora}_{activo_clean}_P{pasos}_{sufijo}{ext}"
+            nueva_ruta = os.path.join(carpeta, nuevo_nombre)
+            # Si ya existe, agregar contador
+            cnt = 1
+            base = os.path.join(carpeta, f"{hora}_{activo_clean}_P{pasos}_{sufijo}")
+            while os.path.exists(nueva_ruta):
+                cnt += 1
+                nueva_ruta = f"{base}_{cnt}{ext}"
+            if os.path.exists(ruta):
+                os.rename(ruta, nueva_ruta)
+            return nueva_ruta
         except Exception as e:
             print(f"  ⚠️ Error renombrando captura: {e}")
+            return ruta
+
+    def _registrar_resultado_simple(self, ciclo_id, ts_inicio, activo, direccion,
+                                     pasos, resultado, ganancia, monto_max, imagen):
+        """Guarda en la tabla resultados_simple."""
+        try:
+            try:
+                hora = int(ts_inicio[11:13]) if ts_inicio else datetime.now().hour
+            except Exception:
+                hora = datetime.now().hour
+            self.db.registrar_resultado_simple({
+                "ciclo_id": ciclo_id, "run_id": self._run_id,
+                "timestamp_inicio": ts_inicio,
+                "timestamp_fin": datetime.now().isoformat(),
+                "hora": hora,
+                "activo": activo, "direccion": direccion,
+                "num_martingalas": pasos, "resultado": resultado,
+                "ganancia_neta": round(ganancia, 2),
+                "monto_maximo": monto_max,
+                "imagen": imagen,
+            })
+        except Exception as e:
+            print(f"  ⚠️ Error guardando resultado simple: {e}")
 
     def _escuchar_teclado(self):
         """Hilo daemon — detecta Ctrl+Espacio para pausar/reanudar búsqueda de señales."""
@@ -1648,6 +2227,13 @@ class GoldBot:
             self.esperar_nueva_vela()
             if self._stop_event.is_set() or stop_event.is_set():
                 break
+
+            # ── Esperar reconexión si la red cayó ──
+            if not self._red_ok.is_set():
+                print(f"   ⏸️  [{activo}] Sin red — esperando reconexión...")
+                self._red_ok.wait()
+                if self._stop_event.is_set() or stop_event.is_set():
+                    break
 
             # ── Pausa (Ctrl+Espacio) ──
             if self._pause_event.is_set():
@@ -1701,13 +2287,17 @@ class GoldBot:
                     "close":         round(float(vela["close"]), 5),
                 }
 
+                # ── Calcular indicadores extra (no afecta logica de entrada) ──
+                indicadores_extra = calcular_indicadores_extra(df)
+
                 icono = "🟢" if direccion == "call" else "🔴"
                 print(f"\n  {icono} SEÑAL {direccion.upper()} → {activo} ({payout}%)")
 
                 ruta_captura = self._generar_captura(df, activo, direccion, payout, CONFIG["monto_base"])
 
                 try:
-                    self._ciclo_trade(activo, direccion, vela_data, ruta_captura=ruta_captura)
+                    self._ciclo_trade(activo, direccion, vela_data, ruta_captura=ruta_captura,
+                                      indicadores_extra=indicadores_extra)
                 finally:
                     with self._lock:
                         self._estado_activos.pop(activo, None)
@@ -1722,14 +2312,18 @@ class GoldBot:
                     self._mostrar_tabla_ciclos()
 
             except Exception as e:
+                err_str = str(e).lower()
                 print(f"  ⚠️ [{activo}] Error en hilo: {e}")
                 with self._lock:
                     self._estado_activos.pop(activo, None)
-                # liberar semáforo solo si fue adquirido
                 try:
                     self._sem_paralelo.release()
                 except Exception:
                     pass
+                # Si es error de conexión, señalar para que el coordinador reconecte
+                if any(k in err_str for k in ("closed", "connection", "timeout", "websocket", "broken")):
+                    self._red_ok.clear()
+                    time.sleep(5)
 
     def _coordinador(self):
         """
@@ -1738,11 +2332,58 @@ class GoldBot:
         Cada hilo observa, entra y maneja su martingala de forma autónoma.
         """
         ultimo_scan    = 0
+        ultimo_watchdog = 0
         hilos_activos  = {}   # activo → Thread
         stop_events    = {}   # activo → Event (para detener hilos individuales)
 
         while not self._stop_event.is_set():
             ahora = time.time()
+
+            # ── Watchdog de conexión ──
+            try:
+                conectado = self.api.check_connect()
+            except Exception:
+                conectado = False
+            if not conectado:
+                self._red_ok.clear()  # pausar todos los hilos
+                print(f"  ⚠️  [{datetime.now().strftime('%H:%M:%S')}] Conexión perdida — reconectando...")
+                reconectado = False
+                for intento in range(1, 6):
+                    if self._stop_event.is_set(): break
+                    try:
+                        ok, _ = self.api.connect()
+                        if ok:
+                            reconectado = True
+                            print(f"  ✅ Reconectado (intento {intento}) — forzando rescan...")
+                            ultimo_scan = 0
+                            break
+                    except Exception:
+                        pass
+                    print(f"  🔄 Intento {intento}/5 fallido — esperando 15s...")
+                    for _ in range(15):
+                        if self._stop_event.is_set(): break
+                        time.sleep(1)
+                if not reconectado:
+                    print(f"  ⏸️  [{datetime.now().strftime('%H:%M:%S')}] Sin conexión — modo espera hasta recuperar red...")
+                    espera = 0
+                    while not self._stop_event.is_set():
+                        time.sleep(30)
+                        espera += 30
+                        try:
+                            ok, _ = self.api.connect()
+                            if ok:
+                                reconectado = True
+                                print(f"  ✅ [{datetime.now().strftime('%H:%M:%S')}] Conexión restaurada tras {espera//60}m {espera%60}s — reanudando...")
+                                ultimo_scan = 0
+                                break
+                        except Exception:
+                            pass
+                        if espera % 300 == 0:
+                            print(f"  ⏸️  [{datetime.now().strftime('%H:%M:%S')}] Aún sin conexión ({espera//60}m esperando)...")
+                if reconectado:
+                    self._red_ok.set()  # reanudar todos los hilos
+                else:
+                    continue
 
             # ── Rescanear payout y ajustar hilos ──
             if ahora - ultimo_scan >= CONFIG["rescan_intervalo"] * 60:
@@ -1750,7 +2391,31 @@ class GoldBot:
                 print(f"  🔍 ESCANEO DE PAYOUT  [{datetime.now().strftime('%H:%M:%S')}]")
                 print(f"{'═'*62}")
 
-                activos_scan = self.obtener_activos_rentables()
+                activos_scan = None
+                _resultado   = []
+                def _hacer_scan():
+                    try:
+                        _resultado.append(self.obtener_activos_rentables())
+                    except Exception:
+                        _resultado.append([])
+                _t = threading.Thread(target=_hacer_scan, daemon=True)
+                _t.start()
+                _t.join(timeout=60)  # 60 segundos máximo
+                if _t.is_alive():
+                    print("  ⚠️  Escaneo colgado — reconectando y reiniciando hilos...")
+                    try:
+                        self.api.connect()
+                    except Exception:
+                        pass
+                    # Matar todos los hilos para que se recreen tras el rescan
+                    for ev in stop_events.values():
+                        ev.set()
+                    hilos_activos.clear()
+                    stop_events.clear()
+                    self._red_ok.set()
+                    ultimo_scan = time.time() - CONFIG["rescan_intervalo"] * 60 + 30
+                    continue
+                activos_scan = _resultado[0] if _resultado else []
                 ultimo_scan  = time.time()
 
                 total_revisados = len(self.api.get_all_open_time().get("binary", {})) if activos_scan else 0
@@ -1772,7 +2437,15 @@ class GoldBot:
                 for nombre in list(stop_events):
                     if nombre not in activos_nuevos:
                         stop_events[nombre].set()
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
                         print(f"  🔴 [{nombre}] fuera de payout — hilo detenido")
+
+                # Limpiar hilos muertos del diccionario
+                for nombre in list(hilos_activos):
+                    if not hilos_activos[nombre].is_alive():
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
 
                 # Arrancar hilos para activos nuevos o caídos
                 for activo_info in activos_scan:
@@ -1795,7 +2468,20 @@ class GoldBot:
 
                     print(f"  {activo_info['payout']:>6.1f}%  {activo_info['nombre']:<26}  [{estado}]")
 
-                print(f"\n  👁️  {len(activos_scan)} hilos observando en paralelo")
+                vivos = sum(1 for t in hilos_activos.values() if t.is_alive())
+                print(f"\n  👁️  {vivos} hilos activos observando en paralelo")
+
+            # ── Watchdog: reiniciar hilos muertos cada 5 min ──
+            if ahora - ultimo_watchdog >= 300:
+                ultimo_watchdog = ahora
+                muertos = [n for n, t in hilos_activos.items() if not t.is_alive()]
+                if muertos:
+                    print(f"  🔁 Watchdog: reiniciando {len(muertos)} hilos caídos: {muertos}")
+                    for nombre in muertos:
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
+                    # Forzar rescan para que los hilos se vuelvan a crear
+                    ultimo_scan = 0
 
             time.sleep(10)
 
@@ -1889,93 +2575,35 @@ class GoldBot:
         print(f"  {'─'*80}")
 
     def mostrar_resumen_final(self):
-        """Muestra resumen al detener el bot — lee directo de la DB para reflejar la sesión real"""
-        try:
-            conn = sqlite3.connect(CONFIG["db_file"])
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
+        """Muestra resumen al detener el bot"""
+        stats = self.telemetria.stats_hoy()
+        glob = self.telemetria.stats_global()
 
-            cur.execute("""SELECT COUNT(*) n,
-                           SUM(CASE WHEN resultado_final='win' THEN 1 ELSE 0 END) wins,
-                           SUM(CASE WHEN resultado_final='loss' THEN 1 ELSE 0 END) losses,
-                           SUM(ganancia_neta) neto
-                           FROM ciclos WHERE run_id=? AND resultado_final IN ('win','loss')""",
-                        (self._run_id,))
-            r = dict(cur.fetchone())
-            total  = r['n'] or 0
-            wins   = r['wins'] or 0
-            losses = r['losses'] or 0
-            neto   = r['neto'] or 0.0
-            wr     = wins / total * 100 if total else 0.0
+        print("\n" + "═" * 55)
+        print("  📊 RESUMEN DE SESIÓN")
+        print("═" * 55)
+        print(f"  Operaciones hoy: {stats['total_operaciones']}")
+        print(f"  Wins: {stats['wins']} | Losses: {stats['losses']}")
+        print(f"  Win Rate: {stats['winrate']:.1f}%")
+        print(f"  Ganancia hoy: ${stats['ganancia_total']:+.2f}")
+        print(f"  Mejor racha: {stats['racha_max_win']} wins")
+        print(f"  Peor racha: {stats['racha_max_loss']} losses")
 
-            # Racha máxima
-            cur.execute("""SELECT resultado_final FROM ciclos
-                           WHERE run_id=? AND resultado_final IN ('win','loss')
-                           ORDER BY id""", (self._run_id,))
-            resultados = [row[0] for row in cur.fetchall()]
-            racha_max_win = racha_max_loss = racha_tmp = 0
-            for res in resultados:
-                if res == 'win':
-                    racha_tmp = racha_tmp + 1 if racha_tmp >= 0 else 1
-                    racha_max_win = max(racha_max_win, racha_tmp)
-                else:
-                    racha_tmp = racha_tmp - 1 if racha_tmp <= 0 else -1
-                    racha_max_loss = max(racha_max_loss, abs(racha_tmp))
+        if stats.get("por_activo"):
+            print(f"\n  Por activo:")
+            for act, data in stats["por_activo"].items():
+                wr = data['wins'] / max(data['wins'] + data['losses'], 1) * 100
+                print(f"    {act}: {data['wins']}W/{data['losses']}L "
+                      f"({wr:.0f}%) → ${data['ganancia']:+.2f}")
 
-            # Por paso
-            cur.execute("""SELECT pasos_usados, resultado_final, COUNT(*) n, SUM(ganancia_neta) neto
-                           FROM ciclos WHERE run_id=? AND resultado_final IN ('win','loss')
-                           GROUP BY pasos_usados, resultado_final ORDER BY pasos_usados""",
-                        (self._run_id,))
-            from collections import defaultdict
-            por_paso = defaultdict(lambda: {'wins':0,'losses':0,'neto':0})
-            for row in cur.fetchall():
-                p = row['pasos_usados']
-                por_paso[p]['neto'] += row['neto']
-                if row['resultado_final'] == 'win': por_paso[p]['wins'] += row['n']
-                else: por_paso[p]['losses'] += row['n']
+        if stats.get("por_paso_martingala"):
+            print(f"\n  Por paso de martingala:")
+            for paso, data in sorted(stats["por_paso_martingala"].items()):
+                wr = data['wins'] / max(data['total'], 1) * 100
+                print(f"    Paso {paso}: {data['wins']}W/{data['losses']}L ({wr:.0f}%)")
 
-            # Por activo (top 10 por operaciones)
-            cur.execute("""SELECT activo,
-                           SUM(CASE WHEN resultado_final='win' THEN 1 ELSE 0 END) wins,
-                           SUM(CASE WHEN resultado_final='loss' THEN 1 ELSE 0 END) losses,
-                           SUM(ganancia_neta) neto
-                           FROM ciclos WHERE run_id=? AND resultado_final IN ('win','loss')
-                           GROUP BY activo ORDER BY COUNT(*) DESC LIMIT 10""",
-                        (self._run_id,))
-            por_activo = [dict(row) for row in cur.fetchall()]
-            conn.close()
-
-            print("\n" + "═" * 55)
-            print("  📊 RESUMEN DE SESIÓN")
-            print("═" * 55)
-            print(f"  Run ID:          #{self._run_id}")
-            print(f"  Operaciones:     {total}")
-            print(f"  Wins / Losses:   {wins}W / {losses}L")
-            print(f"  Win Rate:        {wr:.1f}%")
-            print(f"  Ganancia neta:   ${neto:+.2f}")
-            print(f"  Mejor racha:     {racha_max_win} wins")
-            print(f"  Peor racha:      {racha_max_loss} losses")
-
-            if por_paso:
-                print(f"\n  Por paso:")
-                for p in sorted(por_paso):
-                    d = por_paso[p]
-                    n = d['wins'] + d['losses']
-                    wr_p = d['wins'] / n * 100 if n else 0
-                    print(f"    P{p}: {n:>4} ops  {d['wins']}W/{d['losses']}L  WR:{wr_p:>5.1f}%  ${d['neto']:+.2f}")
-
-            if por_activo:
-                print(f"\n  Top activos:")
-                for a in por_activo:
-                    n = a['wins'] + a['losses']
-                    wr_a = a['wins'] / n * 100 if n else 0
-                    print(f"    {a['activo']:<25} {a['wins']}W/{a['losses']}L  ({wr_a:.0f}%)  ${a['neto']:+.2f}")
-
-        except Exception as e:
-            print(f"  ⚠️  Error leyendo resumen de DB: {e}")
-
-        print(f"\n  📁 Log: {CONFIG['log_file']}")
+        print(f"\n  📁 Log guardado en: {CONFIG['log_file']}")
+        print(f"  📁 Stats guardadas en: {CONFIG['stats_file']}")
         print("═" * 55)
 
 
@@ -2099,8 +2727,10 @@ def iniciar_servidor_dashboard(db: Database = None, bot=None):
 
             elif path == "/api/db/resumen" and db:
                 ops = db.query("""
-                    SELECT resultado, COUNT(*) as n, ROUND(SUM(ganancia_neta),2) as ganancia
-                    FROM operaciones GROUP BY resultado
+                    SELECT resultado_final AS resultado, COUNT(*) as n,
+                           ROUND(SUM(ganancia_neta),2) as ganancia
+                    FROM ciclos WHERE resultado_final IS NOT NULL
+                    GROUP BY resultado_final
                 """)
                 ciclos = db.query("""
                     SELECT resultado_final, COUNT(*) as n,

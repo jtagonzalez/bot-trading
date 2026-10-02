@@ -1,3 +1,5 @@
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║          ESTRATEGIA GOLD 4.0 v3 — Bot Completo IQ Option        ║
@@ -92,13 +94,16 @@ CONFIG = {
     # --- Telemetría ---
     "log_file": "telemetria.json",
     "stats_file": "estadisticas.json",
-    "db_file": "gold_bot.db",
+    "db_file": "bot_10_produc.db",
     "dashboard_port": 8080,
 
     # --- Gestión de riesgo ---
-    "max_perdidas_diarias": 9999,      # Sin límite (cuenta PRACTICE)
-    "max_operaciones_dia": 9999,      # Sin límite (cuenta PRACTICE)
-    "ganancia_objetivo_dia": 0,       # Sin límite (0 = desactivado)
+    "max_perdidas_diarias": 9999,
+    "max_operaciones_dia": 9999,
+    "ganancia_objetivo_dia": 0,
+
+    # --- Límite de wins diarios ---
+    "max_wins_dia": 0,                 # 0 = desactivado; se configura al iniciar
 
     # --- Observadores ---
     "rescan_intervalo": 15,           # Minutos entre rescaneos de payout
@@ -421,7 +426,7 @@ class Database:
         self._init()
 
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")  # permite lecturas concurrentes
         return conn
@@ -842,8 +847,10 @@ class GoldBot:
         # Control diario
         self.perdidas_hoy = 0
         self.operaciones_hoy = 0
+        self.wins_hoy = 0
         self.ganancia_hoy = 0
         self.dia_actual = datetime.now().date()
+        self._esperando_nuevo_dia = False
 
         # Paralelismo
         self._lock = threading.Lock()
@@ -1267,6 +1274,8 @@ class GoldBot:
             self.ganancia_hoy    += resultado_valor
             if resultado == "loss":
                 self.perdidas_hoy += 1
+            elif resultado == "win":
+                self.wins_hoy += 1
             # Mover de vivos a recientes en dashboard
             info = self._trades_vivos.pop(activo, {})
             info.update({"resultado": resultado, "ganancia": resultado_valor,
@@ -1436,7 +1445,10 @@ class GoldBot:
             self.dia_actual = datetime.now().date()
             self.perdidas_hoy = 0
             self.operaciones_hoy = 0
+            self.wins_hoy = 0
             self.ganancia_hoy = 0
+            self._esperando_nuevo_dia = False
+            print(f"\n  🌅 [{datetime.now().strftime('%H:%M:%S')}] Nuevo día — contadores reiniciados. Reanudando operaciones...")
 
         if self.perdidas_hoy >= CONFIG["max_perdidas_diarias"]:
             return False, f"Límite de {CONFIG['max_perdidas_diarias']} pérdidas diarias alcanzado"
@@ -1446,6 +1458,14 @@ class GoldBot:
 
         if CONFIG["ganancia_objetivo_dia"] > 0 and self.ganancia_hoy >= CONFIG["ganancia_objetivo_dia"]:
             return False, f"Meta diaria de ${CONFIG['ganancia_objetivo_dia']} alcanzada (+${self.ganancia_hoy:.2f})"
+
+        if CONFIG["max_wins_dia"] > 0 and self.wins_hoy >= CONFIG["max_wins_dia"]:
+            if not self._esperando_nuevo_dia:
+                self._esperando_nuevo_dia = True
+                manana = datetime.now().date() + timedelta(days=1)
+                print(f"\n  🏁 [{datetime.now().strftime('%H:%M:%S')}] META ALCANZADA — {self.wins_hoy} wins hoy (+${self.ganancia_hoy:.2f})")
+                print(f"  😴 Bot en espera hasta mañana ({manana})...")
+            return False, f"Meta de {CONFIG['max_wins_dia']} wins diarios alcanzada"
 
         return True, "OK"
 
@@ -1772,7 +1792,15 @@ class GoldBot:
                 for nombre in list(stop_events):
                     if nombre not in activos_nuevos:
                         stop_events[nombre].set()
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
                         print(f"  🔴 [{nombre}] fuera de payout — hilo detenido")
+
+                # Limpiar hilos muertos del diccionario
+                for nombre in list(hilos_activos):
+                    if not hilos_activos[nombre].is_alive():
+                        hilos_activos.pop(nombre, None)
+                        stop_events.pop(nombre, None)
 
                 # Arrancar hilos para activos nuevos o caídos
                 for activo_info in activos_scan:
@@ -1795,7 +1823,8 @@ class GoldBot:
 
                     print(f"  {activo_info['payout']:>6.1f}%  {activo_info['nombre']:<26}  [{estado}]")
 
-                print(f"\n  👁️  {len(activos_scan)} hilos observando en paralelo")
+                vivos = sum(1 for t in hilos_activos.values() if t.is_alive())
+                print(f"\n  👁️  {vivos} hilos activos observando en paralelo")
 
             time.sleep(10)
 
@@ -1819,6 +1848,22 @@ class GoldBot:
             print("❌ Ejecuta conectar() primero")
             return
 
+        # ── Preguntar límite de wins diarios ──
+        while True:
+            try:
+                resp = input("\n  ¿Cuántas operaciones ganadoras por día? (0 = sin límite): ").strip()
+                max_wins = int(resp)
+                if max_wins >= 0:
+                    break
+                print("  ⚠️  Ingresa 0 o un número positivo.")
+            except ValueError:
+                print("  ⚠️  Número inválido.")
+        CONFIG["max_wins_dia"] = max_wins
+        if max_wins > 0:
+            print(f"  ✅ Límite configurado: {max_wins} wins por día — bot espera al día siguiente al alcanzarlo.")
+        else:
+            print(f"  ✅ Sin límite de wins diarios.")
+
         # ── Preguntar número de operaciones simultáneas ──
         while True:
             try:
@@ -1831,7 +1876,6 @@ class GoldBot:
                 print("  ⚠️  Número inválido.")
         self._max_paralelo = n
         self._sem_paralelo = threading.Semaphore(n)
-        # El pool se conectó con 10 slots; el semáforo limita cuántos usamos
 
         print("\n" + "═" * 62)
         print("  🚀 GOLD 4.0 v3 — Bot Activo")
@@ -1842,6 +1886,8 @@ class GoldBot:
         print(f"  ⏰ Rescaneo cada : {CONFIG['rescan_intervalo']} min")
         print(f"  📋 Cuenta        : {CONFIG['tipo_cuenta']}")
         print(f"  🔀 Simultáneas   : {n}")
+        limite_str = f"{CONFIG['max_wins_dia']} wins/día" if CONFIG["max_wins_dia"] > 0 else "sin límite"
+        print(f"  🏁 Límite diario : {limite_str}")
         print(f"  ⏸️  Pausar búsqueda: Ctrl+Espacio  (las operaciones activas finalizan solas)")
         print("═" * 62)
 
